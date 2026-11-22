@@ -1,0 +1,6 @@
+{
+  "name": "BlindStudy",
+  "description": "교과서 PDF와 시험 범위를 기반으로 암기장, 예상 문제, 고난도 서술형, 실전 시험지, 취약점 맞춤 재시험을 제공하는 AI 내신 학습 플랫폼",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
