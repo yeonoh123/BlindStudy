@@ -1594,6 +1594,11 @@ ${
     }
   });
 
+  // Catch unknown /api/* routes with JSON 404 before Vite SPA middleware (Express 4 compatible)
+  app.use('/api', (_req: Request, res: Response) => {
+    res.status(404).json({ error: '요청한 API 경로를 찾을 수 없습니다 (HTTP 404).' });
+  });
+
   // JSON syntax error middleware for /api/* routes so bad requests return clean JSON
   app.use((err: unknown, _req: Request, res: Response, next: express.NextFunction) => {
     if (err instanceof SyntaxError && 'body' in err) {
@@ -1636,7 +1641,7 @@ ${
   } else {
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
-    app.get('/{*splat}', (_req: Request, res: Response) => {
+    app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

@@ -43,7 +43,8 @@
    NODE_ENV=production npm start
    ```
 
-## GitHub 업로드 안내
+## GitHub 업로드 및 배포 주의사항
 - **ZIP(지파일)로 다운로드한 경우**: GitHub 웹의 `Upload files`는 `.zip` 파일 자체를 자동으로 압축 해제하지 않습니다. **반드시 먼저 압축을 푼 뒤** 내부 파일(`src/`, `server.ts`, `package.json` 등)을 업로드하거나 Git으로 푸시해 주세요.
+- **정적 호스팅(GitHub Pages 등) 사용 불가 안내**: 이 앱은 `server.ts`(Express + Gemini AI 백엔드)가 함께 실행되어야 AI 분석·문제 생성이 동작합니다. **GitHub Pages**나 `vite preview` 같은 정적 파일 전용 서버에 `dist/`만 올리면 `/api/*` 요청에서 **HTTP 404 오류**가 발생합니다. 배포 시에는 **Render, Railway, Cloud Run, Fly.io** 등 Node.js 서버 실행(`npm run build` 후 `npm start`)을 지원하는 환경을 사용하고 환경 변수에 `GEMINI_API_KEY`를 설정해 주세요.
 - `.gitignore`가 `node_modules/`, `dist/`, `.env*`를 자동 제외하므로 웹 업로드 시에도 `node_modules/`와 `dist/`, `.env` 폴더·파일은 제외하고 올리면 됩니다.
 - 상세 기획 문서는 [`PRD.md`](./PRD.md)에서 확인할 수 있습니다.
