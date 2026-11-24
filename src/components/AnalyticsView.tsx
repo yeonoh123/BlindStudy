@@ -10,7 +10,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { BookOpen, CheckCircle2, RefreshCw, Sparkles, Trash2, XCircle } from 'lucide-react';
+import { BookOpen, CheckCircle2, RefreshCw, ShieldCheck, Sparkles, Trash2, XCircle } from 'lucide-react';
 import type {
   Attempt,
   ExamScope,
@@ -24,6 +24,7 @@ import type {
 } from '../types/study';
 import {
   analyzeWeaknessWithAI,
+  explainWrongAnswerWithAI,
   generateVerifiedQuestions,
   gradeEssayWithAI,
 } from '../lib/api';
@@ -31,10 +32,14 @@ import {
   clearAllStudyHistoryOnly,
   clearEverythingDB,
   recordAttemptAndProgress,
+  saveAttempt,
   saveQuestions,
   saveWeaknessAnalysis,
 } from '../lib/db';
+import { isEssayQuestion, isObjectiveOrShortAnswerCorrect } from '../lib/grading';
 import { PdfPageViewerModal } from './PdfPageViewerModal';
+import { PrivacyInfoModal } from './PrivacyInfoModal';
+import { WrongAnswerAiCard } from './WrongAnswerAiCard';
 
 interface AnalyticsViewProps {
   textbooks: Textbook[];
@@ -73,22 +78,33 @@ export function AnalyticsView({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
-  const [retestQuestions, setRetestQuestions] = useState<Question[]>(() =>
-    questions.filter((q) => q.isRetest).slice(0, 6)
-  );
+  const [activeRetestIds, setActiveRetestIds] = useState<string[] | null>(null);
+  const retestQuestions = useMemo(() => {
+    const allRetests = questions.filter((q) => q.isRetest);
+    if (activeRetestIds) {
+      const idSet = new Set(activeRetestIds);
+      return allRetests.filter((q) => idSet.has(q.id));
+    }
+    return allRetests.slice(0, 6);
+  }, [questions, activeRetestIds]);
   const [draftAnswers, setDraftAnswers] = useState<Record<string, string>>({});
   const [gradingId, setGradingId] = useState<string | null>(null);
+  const [explainingId, setExplainingId] = useState<string | null>(null);
+  const [explainErrors, setExplainErrors] = useState<Record<string, string>>({});
   const [viewerTarget, setViewerTarget] = useState<{ textbook: Textbook; page: number } | null>(
     null
   );
   const [confirmClearType, setConfirmClearType] = useState<'history' | 'all' | null>(null);
+  const [showPrivacyModal, setShowPrivacyModal] = useState(false);
 
   const totalAttempts = attempts.length;
   const correctCount = attempts.filter((a) => a.isCorrect).length;
   const overallAccuracy =
     totalAttempts > 0 ? Math.round((correctCount / totalAttempts) * 100) : 0;
 
-  const essayAttempts = attempts.filter((a) => a.type === '서술형' && a.maxPoints > 0);
+  const essayAttempts = attempts.filter(
+    (a) => (a.type === '서술형' || Boolean(a.feedback)) && a.maxPoints > 0
+  );
   const essayAvg =
     essayAttempts.length > 0
       ? Math.round(
@@ -127,12 +143,19 @@ export function AnalyticsView({
       if (a.isCorrect) curr.correct += 1;
       map.set(unit, curr);
     }
+    const seenLabels = new Map<string, number>();
     return Array.from(map.values())
       .slice(0, 8)
-      .map((u) => ({
-        name: u.unit.length > 10 ? `${u.unit.slice(0, 10)}…` : u.unit,
-        정답률: Math.round((u.correct / u.total) * 100),
-      }));
+      .map((u) => {
+        const base = u.unit.length > 10 ? `${u.unit.slice(0, 10)}…` : u.unit;
+        const count = (seenLabels.get(base) || 0) + 1;
+        seenLabels.set(base, count);
+        const uniqueName = count > 1 ? `${base} (${count})` : base;
+        return {
+          name: uniqueName,
+          정답률: Math.round((u.correct / u.total) * 100),
+        };
+      });
   }, [attempts]);
 
   // Difficulty achievement
@@ -161,10 +184,12 @@ export function AnalyticsView({
       }));
   }, [examSessions]);
 
-  const latestAttemptByQ = useMemo(() => {
-    const map = new Map<string, Attempt>();
+  const attemptsByQ = useMemo(() => {
+    const map = new Map<string, Attempt[]>();
     for (const a of attempts) {
-      if (!map.has(a.questionId)) map.set(a.questionId, a);
+      const list = map.get(a.questionId) || [];
+      list.push(a);
+      map.set(a.questionId, list);
     }
     return map;
   }, [attempts]);
@@ -211,7 +236,7 @@ export function AnalyticsView({
           type: a.type,
           difficulty: a.difficulty,
           isCorrect: a.isCorrect,
-          earnedPoints: a.earnedPoints,
+          earnedPoints: a.manualOverridePoints ?? a.earnedPoints,
           maxPoints: a.maxPoints,
           isRetest: a.isRetest,
         })),
@@ -228,10 +253,18 @@ export function AnalyticsView({
   }
 
   async function handleGenerateRetest() {
+    const aiWeakNames = new Set((weaknessAnalysis?.weakConcepts || []).map((w) => w.conceptName));
+    const scopeIdFromProgress =
+      learningProgress.find((lp) => aiWeakNames.has(lp.conceptName))?.scopeId ||
+      localWeakConcepts[0]?.scopeId ||
+      attempts.find((a) => !a.isCorrect)?.scopeId;
+
     const targetScope =
+      (scopeIdFromProgress && scopes.find((s) => s.id === scopeIdFromProgress)) ||
       scopes.find((s) =>
-        localWeakConcepts.some((wc) => wc.scopeId === s.id)
-      ) || scopes[0];
+        s.extractedConcepts.some((c) => aiWeakNames.has(c.name))
+      ) ||
+      scopes[0];
     const targetTb = targetScope
       ? textbooks.find((t) => t.id === targetScope.textbookId)
       : undefined;
@@ -322,11 +355,15 @@ export function AnalyticsView({
         .filter((q) => q.scopeId === targetScope.id)
         .map((q) => q.questionText);
 
+      const matchedProgress = learningProgress.find((lp) =>
+        focusConcepts.some((fc) => fc.conceptName === lp.conceptName)
+      );
+
       const res = await generateVerifiedQuestions({
         scopeId: targetScope.id,
         subject: targetScope.subject,
         scopeName: targetScope.name,
-        difficulty: localWeakConcepts[0]?.recommendedDifficulty || '심화',
+        difficulty: matchedProgress?.recommendedDifficulty || localWeakConcepts[0]?.recommendedDifficulty || '심화',
         requestedCounts,
         concepts: targetScope.extractedConcepts,
         pages,
@@ -336,8 +373,8 @@ export function AnalyticsView({
       });
 
       await saveQuestions(res.questions);
+      setActiveRetestIds(res.questions.map((q) => q.id));
       await onRefreshData();
-      setRetestQuestions(res.questions);
       setStatusMsg(
         `취약 개념 ${focusConcepts.map((f) => f.conceptName).join(', ')}에 대해 기존과 다른 유형의 맞춤형 재시험 ${res.questions.length}문항을 생성했습니다.`
       );
@@ -345,6 +382,40 @@ export function AnalyticsView({
       setErrorMsg(err instanceof Error ? err.message : '맞춤형 재시험 생성 중 오류가 발생했습니다.');
     } finally {
       setRetesting(false);
+    }
+  }
+
+  async function runWrongExplanation(
+    q: Question,
+    targetAttempt: Attempt,
+    subjectName: string,
+    revealCorrectAnswer: boolean
+  ) {
+    setExplainingId(q.id);
+    setExplainErrors((prev) => {
+      const next = { ...prev };
+      delete next[q.id];
+      return next;
+    });
+    try {
+      const wrongAnalysis = await explainWrongAnswerWithAI({
+        subject: subjectName,
+        question: q,
+        userAnswer: targetAttempt.userAnswer,
+        revealCorrectAnswer,
+      });
+      await saveAttempt({
+        ...targetAttempt,
+        wrongAnalysis,
+      });
+      await onRefreshData();
+    } catch (err) {
+      setExplainErrors((prev) => ({
+        ...prev,
+        [q.id]: err instanceof Error ? err.message : '오답 원인 분석 중 오류가 발생했습니다.',
+      }));
+    } finally {
+      setExplainingId((curr) => (curr === q.id ? null : curr));
     }
   }
 
@@ -356,60 +427,61 @@ export function AnalyticsView({
     const userAnswer = (draftAnswers[q.id] || '').trim();
     if (!userAnswer) return;
 
+    const priorCount = (attemptsByQ.get(q.id) || []).length;
     setGradingId(q.id);
     try {
-      const isEssay = q.type === '서술형' || !q.choices;
-      if (isEssay && q.type === '서술형') {
+      const isEssayLike = isEssayQuestion(q);
+      let createdAttempt: Attempt;
+      if (isEssayLike) {
         const pages: PageTextEntry[] = [];
         for (const p of q.sourcePages) {
           if (tb.pageText[p]) pages.push(tb.pageText[p]);
         }
         const fb = await gradeEssayWithAI({ question: q, userAnswer, pages });
-        await recordAttemptAndProgress(
-          {
-            id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            questionId: q.id,
-            scopeId: scope.id,
-            subject: scope.subject,
-            unitName: q.unitName,
-            conceptTags: q.conceptTags,
-            type: q.type,
-            difficulty: q.difficulty,
-            userAnswer,
-            isCorrect: fb.earnedPoints >= fb.maxPoints * 0.65,
-            earnedPoints: fb.earnedPoints,
-            maxPoints: fb.maxPoints,
-            feedback: fb,
-            isRetest: true,
-            submittedAt: Date.now(),
-          },
-          scope.subject
-        );
+        createdAttempt = {
+          id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          questionId: q.id,
+          scopeId: scope.id,
+          subject: scope.subject,
+          unitName: q.unitName,
+          conceptTags: q.conceptTags,
+          type: q.type,
+          difficulty: q.difficulty,
+          userAnswer,
+          isCorrect: fb.earnedPoints >= fb.maxPoints * 0.65,
+          earnedPoints: fb.earnedPoints,
+          maxPoints: fb.maxPoints,
+          feedback: fb,
+          isRetest: true,
+          submittedAt: Date.now(),
+        };
       } else {
-        const isCorrect =
-          userAnswer.replace(/\s+/g, '').toLowerCase() ===
-          q.correctAnswer.replace(/\s+/g, '').toLowerCase();
-        await recordAttemptAndProgress(
-          {
-            id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            questionId: q.id,
-            scopeId: scope.id,
-            subject: scope.subject,
-            unitName: q.unitName,
-            conceptTags: q.conceptTags,
-            type: q.type,
-            difficulty: q.difficulty,
-            userAnswer,
-            isCorrect,
-            earnedPoints: isCorrect ? q.points : 0,
-            maxPoints: q.points,
-            isRetest: true,
-            submittedAt: Date.now(),
-          },
-          scope.subject
-        );
+        const isCorrect = isObjectiveOrShortAnswerCorrect(q, userAnswer);
+        createdAttempt = {
+          id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          questionId: q.id,
+          scopeId: scope.id,
+          subject: scope.subject,
+          unitName: q.unitName,
+          conceptTags: q.conceptTags,
+          type: q.type,
+          difficulty: q.difficulty,
+          userAnswer,
+          isCorrect,
+          earnedPoints: isCorrect ? q.points : 0,
+          maxPoints: q.points,
+          isRetest: true,
+          submittedAt: Date.now(),
+        };
       }
+
+      await recordAttemptAndProgress(createdAttempt, scope.subject);
       await onRefreshData();
+
+      if (!createdAttempt.isCorrect) {
+        const revealNow = priorCount + 1 >= 2;
+        void runWrongExplanation(q, createdAttempt, scope.subject, revealNow);
+      }
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : '재시험 채점 중 오류가 발생했습니다.');
     } finally {
@@ -420,11 +492,13 @@ export function AnalyticsView({
   async function handleClearData(mode: 'history' | 'all') {
     if (mode === 'history') {
       await clearAllStudyHistoryOnly();
-      setRetestQuestions([]);
+      setActiveRetestIds(null);
+      setDraftAnswers({});
       setStatusMsg('문제 풀이 및 시험 기록이 초기화되었습니다. 등록된 교과서와 범위는 유지됩니다.');
     } else {
       await clearEverythingDB();
-      setRetestQuestions([]);
+      setActiveRetestIds(null);
+      setDraftAnswers({});
       setStatusMsg('모든 교과서, 범위, 학습 기록이 초기화되었습니다.');
     }
     setConfirmClearType(null);
@@ -677,7 +751,11 @@ export function AnalyticsView({
 
               <div className="space-y-5">
                 {retestQuestions.map((q, idx) => {
-                  const att = latestAttemptByQ.get(q.id);
+                  const qAttempts = attemptsByQ.get(q.id) || [];
+                  const att = qAttempts[0];
+                  const attemptCount = qAttempts.length;
+                  const shouldRevealAnswer = Boolean(att && (att.isCorrect || attemptCount >= 2));
+                  const isEssayLike = isEssayQuestion(q);
                   const val = draftAnswers[q.id] ?? att?.userAnswer ?? '';
                   const sc = scopes.find((s) => s.id === q.scopeId);
                   const tb = sc ? textbooks.find((t) => t.id === sc.textbookId) : undefined;
@@ -686,10 +764,12 @@ export function AnalyticsView({
                     <div key={q.id} className="rounded-lg border border-slate-200 p-5">
                       <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
                         <span>
-                          재시험 {idx + 1} · {q.type} · {q.difficulty} · 취약 개념:{' '}
-                          {q.conceptTags.join(', ')}
+                          재시험 {idx + 1} · {q.type} · {q.difficulty}
+                          {(!isEssayLike || Boolean(att)) && q.conceptTags.length > 0
+                            ? ` · 취약 개념: ${q.conceptTags.join(', ')}`
+                            : ''}
                         </span>
-                        {tb && q.sourcePages.length > 0 && (
+                        {tb && (!isEssayLike || Boolean(att)) && q.sourcePages.length > 0 && (
                           <button
                             type="button"
                             onClick={() =>
@@ -716,34 +796,45 @@ export function AnalyticsView({
                       <div className="mt-3">
                         {q.choices && q.choices.length > 0 ? (
                           <div className="space-y-2">
-                            {q.choices.map((c, cIdx) => (
-                              <button
-                                key={cIdx}
-                                type="button"
-                                onClick={() =>
-                                  setDraftAnswers((prev) => ({ ...prev, [q.id]: c }))
-                                }
-                                className={`flex w-full items-start gap-2 rounded-lg border px-3.5 py-2 text-left text-sm ${
-                                  val === c
-                                    ? 'border-blue-600 bg-blue-50 text-blue-900'
-                                    : 'border-slate-200 hover:bg-slate-50'
-                                }`}
-                              >
-                                <span className="font-mono-num text-xs text-slate-500">
-                                  {cIdx + 1}.
-                                </span>
-                                <span>{c}</span>
-                              </button>
-                            ))}
+                            {q.choices.map((c, cIdx) => {
+                              const selected = val === c;
+                              const isAnswer = shouldRevealAnswer && c === q.correctAnswer;
+                              const isWrongSelection =
+                                att && !att.isCorrect && att.userAnswer === c && selected;
+
+                              return (
+                                <button
+                                  key={cIdx}
+                                  type="button"
+                                  onClick={() =>
+                                    setDraftAnswers((prev) => ({ ...prev, [q.id]: c }))
+                                  }
+                                  className={`flex w-full items-start gap-2 rounded-lg border px-3.5 py-2 text-left text-sm ${
+                                    isAnswer
+                                      ? 'border-emerald-500 bg-emerald-50 text-emerald-900'
+                                      : isWrongSelection
+                                      ? 'border-red-400 bg-red-50 text-red-900'
+                                      : selected
+                                      ? 'border-blue-600 bg-blue-50 text-blue-900'
+                                      : 'border-slate-200 hover:bg-slate-50'
+                                  }`}
+                                >
+                                  <span className="font-mono-num text-xs text-slate-500">
+                                    {cIdx + 1}.
+                                  </span>
+                                  <span>{c}</span>
+                                </button>
+                              );
+                            })}
                           </div>
-                        ) : q.type === '서술형' ? (
+                        ) : isEssayLike ? (
                           <textarea
                             rows={3}
                             value={val}
                             onChange={(e) =>
                               setDraftAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))
                             }
-                            placeholder="변형 서술형 답안을 입력하세요"
+                            placeholder="변형 서술형 답안을 작성하세요"
                             className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
                           />
                         ) : (
@@ -766,7 +857,13 @@ export function AnalyticsView({
                           onClick={() => void handleSubmitRetestAnswer(q)}
                           className="rounded-lg bg-slate-900 px-4 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-40"
                         >
-                          {gradingId === q.id ? '채점 중...' : '재시험 답안 제출'}
+                          {gradingId === q.id
+                            ? '채점 중...'
+                            : att && !shouldRevealAnswer
+                            ? '2차 도전 제출 (정답 공개)'
+                            : att
+                            ? '다시 제출하기'
+                            : '재시험 답안 제출'}
                         </button>
                         {att && (
                           <span
@@ -780,7 +877,7 @@ export function AnalyticsView({
                               </>
                             ) : (
                               <>
-                                <XCircle className="h-4 w-4" /> 재학습 필요
+                                <XCircle className="h-4 w-4" /> 재학습 필요 ({attemptCount}차 시도)
                               </>
                             )}
                           </span>
@@ -788,9 +885,37 @@ export function AnalyticsView({
                       </div>
 
                       {att && (
-                        <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-relaxed text-slate-700">
-                          <p className="font-semibold text-slate-900">정답: {q.correctAnswer}</p>
-                          <p className="mt-1">{q.explanation}</p>
+                        <div className="mt-3 space-y-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-relaxed text-slate-700">
+                          {shouldRevealAnswer ? (
+                            <>
+                              <p className="font-semibold text-slate-900">정답: {q.correctAnswer}</p>
+                              <p>{q.explanation}</p>
+                            </>
+                          ) : (
+                            <p className="rounded border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-amber-900">
+                              1차 시도에서는 정답이 바로 공개되지 않습니다. 아래 AI 오답 원인을
+                              참고해 <strong>2차 도전</strong>을 제출하면 정답이 공개됩니다.
+                            </p>
+                          )}
+
+                          {att.feedback && (
+                            <div className="border-t border-slate-200 pt-2">
+                              <p className="font-semibold text-slate-800">AI 서술형 채점 피드백:</p>
+                              <p className="mt-1">{att.feedback.improvementDirection}</p>
+                            </div>
+                          )}
+
+                          {!att.isCorrect && sc && (
+                            <WrongAnswerAiCard
+                              analysis={att.wrongAnalysis}
+                              loading={explainingId === q.id}
+                              error={explainErrors[q.id]}
+                              revealCorrectAnswer={shouldRevealAnswer}
+                              onRequestExplain={() =>
+                                void runWrongExplanation(q, att, sc.subject, shouldRevealAnswer)
+                              }
+                            />
+                          )}
                         </div>
                       )}
                     </div>
@@ -840,6 +965,14 @@ export function AnalyticsView({
               <>
                 <button
                   type="button"
+                  onClick={() => setShowPrivacyModal(true)}
+                  className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  <ShieldCheck className="h-3.5 w-3.5 text-blue-600" />
+                  개인정보 보호 안내
+                </button>
+                <button
+                  type="button"
                   onClick={() => setConfirmClearType('history')}
                   className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
                 >
@@ -865,6 +998,19 @@ export function AnalyticsView({
           textbook={viewerTarget.textbook}
           initialPage={viewerTarget.page}
           onClose={() => setViewerTarget(null)}
+        />
+      )}
+
+      {showPrivacyModal && (
+        <PrivacyInfoModal
+          stats={{
+            textbooks: textbooks.length,
+            scopes: scopes.length,
+            attempts: attempts.length,
+            examSessions: examSessions.length,
+          }}
+          onRefreshData={onRefreshData}
+          onClose={() => setShowPrivacyModal(false)}
         />
       )}
     </div>

@@ -6,25 +6,26 @@ import type {
   ExamSession,
   LearningProgress,
   Question,
+  StudyModeKey,
   Textbook,
   WeaknessAnalysisResult,
 } from './types/study';
 import { loadAllData } from './lib/db';
 import { checkServerHealth } from './lib/api';
-import { DashboardView } from './components/DashboardView';
-import type { NavTab, StudyModeKey } from './components/DashboardView';
-import { TextbookManagerView } from './components/TextbookManagerView';
-import { ScopeSetupView } from './components/ScopeSetupView';
+import { QuickStudySetupView } from './components/QuickStudySetupView';
 import { ModeAClozeView } from './components/ModeAClozeView';
 import { ModeBQuestionsView } from './components/ModeBQuestionsView';
 import { ModeCEssayView } from './components/ModeCEssayView';
 import { ModeDExamView } from './components/ModeDExamView';
+import { Lock } from 'lucide-react';
 import { AnalyticsView } from './components/AnalyticsView';
+import { PrivacyInfoModal } from './components/PrivacyInfoModal';
+import { getSubjectTheme } from './lib/subjectTheme';
 
-const NAV_ITEMS: Array<{ key: NavTab; label: string }> = [
-  { key: 'dashboard', label: '대시보드' },
-  { key: 'textbooks', label: '교과서' },
-  { key: 'scopes', label: '시험 범위' },
+type MainTab = 'setup' | 'study' | 'analytics';
+
+const NAV_ITEMS: Array<{ key: MainTab; label: string }> = [
+  { key: 'setup', label: 'PDF · 범위 설정' },
   { key: 'study', label: '학습 모드' },
   { key: 'analytics', label: '취약점 분석' },
 ];
@@ -37,10 +38,9 @@ const STUDY_MODES: Array<{ key: StudyModeKey; label: string }> = [
 ];
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
-  const [studyMode, setStudyMode] = useState<StudyModeKey>('cloze');
+  const [activeTab, setActiveTab] = useState<MainTab>('setup');
+  const [studyMode, setStudyMode] = useState<StudyModeKey>('questions');
   const [selectedScopeId, setSelectedScopeId] = useState<string>('');
-  const [preselectedTextbookId, setPreselectedTextbookId] = useState<string | null>(null);
 
   const [loadingDb, setLoadingDb] = useState(true);
   const [apiKeyConfigured, setApiKeyConfigured] = useState(true);
@@ -53,6 +53,11 @@ export default function App() {
   const [examSessions, setExamSessions] = useState<ExamSession[]>([]);
   const [learningProgress, setLearningProgress] = useState<LearningProgress[]>([]);
   const [weaknessAnalysis, setWeaknessAnalysis] = useState<WeaknessAnalysisResult | null>(null);
+  const [showPrivacyModal, setShowPrivacyModal] = useState(false);
+  const [setupThemeContext, setSetupThemeContext] = useState<{
+    subject?: string;
+    title?: string;
+  }>({});
 
   const refreshData = useCallback(async () => {
     const data = await loadAllData();
@@ -91,26 +96,45 @@ export default function App() {
     };
   }, [refreshData]);
 
+  const handleActiveThemeChange = useCallback((subject?: string, title?: string) => {
+    setSetupThemeContext((prev) =>
+      prev.subject === subject && prev.title === title ? prev : { subject, title }
+    );
+  }, []);
+
   function handleStartStudyMode(scopeId: string, mode: StudyModeKey) {
     setSelectedScopeId(scopeId);
     setStudyMode(mode);
     setActiveTab('study');
   }
 
-  function handleSelectForScope(textbookId: string) {
-    setPreselectedTextbookId(textbookId);
-    setActiveTab('scopes');
-  }
+  const activeScope = scopes.find((s) => s.id === selectedScopeId) || scopes[0];
+  const activeScopeTextbook = activeScope
+    ? textbooks.find((t) => t.id === activeScope.textbookId)
+    : undefined;
+
+  const theme =
+    activeTab === 'setup'
+      ? getSubjectTheme(
+          setupThemeContext.subject ?? textbooks[0]?.subject,
+          setupThemeContext.title ?? textbooks[0]?.title
+        )
+      : getSubjectTheme(
+          activeScope?.subject ?? textbooks[0]?.subject,
+          activeScopeTextbook?.title ?? textbooks[0]?.title
+        );
 
   return (
-    <div className="min-h-screen bg-[#F8FAFC] text-[#1E293B]">
+    <div
+      className={`flex min-h-screen flex-col text-[#1E293B] transition-[background-color] duration-500 print:bg-white print:bg-none ${theme.backdropClass}`}
+    >
       {/* Strictly 3-zone Top Navigation Bar */}
-      <header className="no-print sticky top-0 z-30 border-b border-slate-200 bg-white">
+      <header className={`no-print sticky top-0 z-30 border-b transition-colors duration-500 ${theme.headerClass}`}>
         <div className="mx-auto flex h-16 max-w-6xl items-center justify-between gap-8 px-4 sm:px-6">
           {/* Zone 1: Single-line Wordmark */}
           <button
             type="button"
-            onClick={() => setActiveTab('dashboard')}
+            onClick={() => setActiveTab('setup')}
             className="text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
           >
             BlindStudy
@@ -141,10 +165,16 @@ export default function App() {
           <div className="shrink-0">
             <button
               type="button"
-              onClick={() => setActiveTab('textbooks')}
+              onClick={() => {
+                if (scopes.length > 0) {
+                  setActiveTab('study');
+                } else {
+                  setActiveTab('setup');
+                }
+              }}
               className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
             >
-              교과서 등록
+              학습 바로가기
             </button>
           </div>
         </div>
@@ -169,7 +199,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+      <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6">
         {!apiKeyConfigured && (
           <div className="no-print mb-6 rounded-xl border border-amber-200 bg-amber-50 px-5 py-3.5 text-sm text-amber-900">
             서버에 Gemini API 키가 아직 설정되지 않았습니다. AI Studio의{' '}
@@ -184,35 +214,14 @@ export default function App() {
           </div>
         ) : (
           <>
-            {activeTab === 'dashboard' && (
-              <DashboardView
+            {activeTab === 'setup' && (
+              <QuickStudySetupView
                 textbooks={textbooks}
                 scopes={scopes}
-                attempts={attempts}
-                clozeCards={clozeCards}
-                examSessions={examSessions}
-                learningProgress={learningProgress}
-                onNavigate={setActiveTab}
-                onStartStudyMode={handleStartStudyMode}
-                onStartWeaknessRetest={() => setActiveTab('analytics')}
-              />
-            )}
-
-            {activeTab === 'textbooks' && (
-              <TextbookManagerView
-                textbooks={textbooks}
-                onRefreshData={refreshData}
-                onSelectForScope={handleSelectForScope}
-              />
-            )}
-
-            {activeTab === 'scopes' && (
-              <ScopeSetupView
-                textbooks={textbooks}
-                scopes={scopes}
-                preselectedTextbookId={preselectedTextbookId}
                 onRefreshData={refreshData}
                 onStartStudyMode={handleStartStudyMode}
+                onNavigateToAnalytics={() => setActiveTab('analytics')}
+                onActiveThemeChange={handleActiveThemeChange}
               />
             )}
 
@@ -228,73 +237,101 @@ export default function App() {
                       진행합니다.
                     </p>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('setup')}
+                    className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
+                  >
+                    PDF · 범위 다시 설정
+                  </button>
                 </div>
 
-                {/* Mode Switcher */}
-                <div className="no-print flex flex-wrap gap-1.5 rounded-xl border border-slate-200 bg-white p-1.5">
-                  {STUDY_MODES.map((m) => (
+                {scopes.length === 0 ? (
+                  <div className="rounded-xl border border-slate-200 bg-white p-12 text-center">
+                    <h2 className="text-base font-bold text-slate-900">
+                      아직 등록된 PDF와 시험 범위가 없습니다
+                    </h2>
+                    <p className="mt-2 text-sm text-slate-600">
+                      교과서 PDF를 넣고 페이지 범위만 입력하면 바로 암기장, 예상 문제, 서술형, 실전
+                      시험을 시작할 수 있습니다.
+                    </p>
                     <button
-                      key={m.key}
                       type="button"
-                      onClick={() => setStudyMode(m.key)}
-                      className={`flex-1 rounded-lg px-4 py-2 text-xs font-semibold transition-colors whitespace-nowrap ${
-                        studyMode === m.key
-                          ? 'bg-blue-600 text-white'
-                          : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                      }`}
+                      onClick={() => setActiveTab('setup')}
+                      className="mt-5 rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-700"
                     >
-                      {m.label}
+                      PDF · 범위 설정하러 가기
                     </button>
-                  ))}
-                </div>
+                  </div>
+                ) : (
+                  <>
+                    {/* Mode Switcher */}
+                    <div className="no-print flex flex-wrap gap-1.5 rounded-xl border border-slate-200 bg-white p-1.5">
+                      {STUDY_MODES.map((m) => (
+                        <button
+                          key={m.key}
+                          type="button"
+                          onClick={() => setStudyMode(m.key)}
+                          className={`flex-1 rounded-lg px-4 py-2 text-xs font-semibold transition-colors whitespace-nowrap ${
+                            studyMode === m.key
+                              ? 'bg-blue-600 text-white'
+                              : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                          }`}
+                        >
+                          {m.label}
+                        </button>
+                      ))}
+                    </div>
 
-                {studyMode === 'cloze' && (
-                  <ModeAClozeView
-                    scopes={scopes}
-                    textbooks={textbooks}
-                    clozeCards={clozeCards}
-                    selectedScopeId={selectedScopeId}
-                    onSelectScopeId={setSelectedScopeId}
-                    onRefreshData={refreshData}
-                  />
-                )}
+                    {studyMode === 'cloze' && (
+                      <ModeAClozeView
+                        scopes={scopes}
+                        textbooks={textbooks}
+                        clozeCards={clozeCards}
+                        selectedScopeId={selectedScopeId}
+                        onSelectScopeId={setSelectedScopeId}
+                        onRefreshData={refreshData}
+                      />
+                    )}
 
-                {studyMode === 'questions' && (
-                  <ModeBQuestionsView
-                    scopes={scopes}
-                    textbooks={textbooks}
-                    questions={questions}
-                    attempts={attempts}
-                    selectedScopeId={selectedScopeId}
-                    onSelectScopeId={setSelectedScopeId}
-                    onRefreshData={refreshData}
-                  />
-                )}
+                    {studyMode === 'questions' && (
+                      <ModeBQuestionsView
+                        scopes={scopes}
+                        textbooks={textbooks}
+                        questions={questions}
+                        attempts={attempts}
+                        selectedScopeId={selectedScopeId}
+                        onSelectScopeId={setSelectedScopeId}
+                        onRefreshData={refreshData}
+                      />
+                    )}
 
-                {studyMode === 'essay' && (
-                  <ModeCEssayView
-                    scopes={scopes}
-                    textbooks={textbooks}
-                    questions={questions}
-                    attempts={attempts}
-                    selectedScopeId={selectedScopeId}
-                    onSelectScopeId={setSelectedScopeId}
-                    onRefreshData={refreshData}
-                  />
-                )}
+                    {studyMode === 'essay' && (
+                      <ModeCEssayView
+                        scopes={scopes}
+                        textbooks={textbooks}
+                        questions={questions}
+                        attempts={attempts}
+                        selectedScopeId={selectedScopeId}
+                        onSelectScopeId={setSelectedScopeId}
+                        onRefreshData={refreshData}
+                      />
+                    )}
 
-                {studyMode === 'exam' && (
-                  <ModeDExamView
-                    scopes={scopes}
-                    textbooks={textbooks}
-                    questions={questions}
-                    attempts={attempts}
-                    examSessions={examSessions}
-                    selectedScopeId={selectedScopeId}
-                    onSelectScopeId={setSelectedScopeId}
-                    onRefreshData={refreshData}
-                    onStartWeaknessRetest={() => setActiveTab('analytics')}
-                  />
+                    {studyMode === 'exam' && (
+                      <ModeDExamView
+                        scopes={scopes}
+                        textbooks={textbooks}
+                        questions={questions}
+                        attempts={attempts}
+                        examSessions={examSessions}
+                        selectedScopeId={selectedScopeId}
+                        onSelectScopeId={setSelectedScopeId}
+                        onRefreshData={refreshData}
+                        onStartWeaknessRetest={() => setActiveTab('analytics')}
+                      />
+                    )}
+                  </>
                 )}
               </div>
             )}
@@ -315,6 +352,40 @@ export default function App() {
           </>
         )}
       </main>
+
+      <footer className={`no-print border-t transition-colors duration-500 ${theme.footerClass}`}>
+        <div className="mx-auto flex max-w-6xl flex-col items-start justify-between gap-2 px-4 py-4 text-xs text-slate-600 sm:flex-row sm:items-center sm:px-6">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <div className="flex items-center gap-1.5">
+              <Lock className="h-3.5 w-3.5 text-emerald-600 shrink-0" />
+              <span>
+                모든 PDF·학습 기록은 내 브라우저에만 저장되며, AI 요청 시 민감 정보는 자동 마스킹됩니다.
+              </span>
+            </div>
+            <span className={`font-medium ${theme.accentTextClass}`}>· {theme.label}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowPrivacyModal(true)}
+            className="font-semibold text-slate-700 underline underline-offset-2 hover:text-blue-600 whitespace-nowrap shrink-0"
+          >
+            개인정보 보호 · 데이터 관리
+          </button>
+        </div>
+      </footer>
+
+      {showPrivacyModal && (
+        <PrivacyInfoModal
+          stats={{
+            textbooks: textbooks.length,
+            scopes: scopes.length,
+            attempts: attempts.length,
+            examSessions: examSessions.length,
+          }}
+          onRefreshData={refreshData}
+          onClose={() => setShowPrivacyModal(false)}
+        />
+      )}
     </div>
   );
 }

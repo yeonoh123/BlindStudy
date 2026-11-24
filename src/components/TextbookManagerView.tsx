@@ -37,7 +37,8 @@ export function TextbookManagerView({
   const [subjectPreset, setSubjectPreset] = useState('한국사');
   const [customSubject, setCustomSubject] = useState('');
   const [customTitle, setCustomTitle] = useState('');
-  const [pageOffset, setPageOffset] = useState(0);
+  const [pageOffsetInput, setPageOffsetInput] = useState('0');
+  const pageOffset = Number.isFinite(Number(pageOffsetInput)) ? Math.trunc(Number(pageOffsetInput)) : 0;
 
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number } | null>(null);
@@ -127,11 +128,12 @@ export function TextbookManagerView({
     setErrorMsg(null);
     setStatusMsg(null);
 
-    try {
-      const updatedText = { ...tb.pageText };
-      const updatedMapping = { ...tb.pageNumberMapping };
-      const remainingWarnings: number[] = [];
+    let updatedText = { ...tb.pageText };
+    let updatedMapping = { ...tb.pageNumberMapping };
+    let remainingSet = new Set(tb.scanWarnings);
+    let processedCount = 0;
 
+    try {
       for (let i = 0; i < pagesToOcr.length; i++) {
         const pageNum = pagesToOcr[i];
         setOcrProgress(`${pageNum}쪽 AI 이미지 텍스트 인식 중 (${i + 1}/${pagesToOcr.length})`);
@@ -144,42 +146,62 @@ export function TextbookManagerView({
         });
 
         const cleanText = (ocrRes.extractedText || '').trim();
-        updatedText[pageNum] = {
-          pageNumber: pageNum,
-          printedPageLabel:
-            ocrRes.printedPageCandidate?.trim() || updatedMapping[pageNum] || String(pageNum),
-          text: cleanText,
-          charCount: cleanText.length,
-          isLowText: cleanText.length < 35,
-          ocrApplied: true,
-          visualWarning: ocrRes.hasIncompleteVisuals
-            ? ocrRes.visualWarning || '그림·도표 일부가 텍스트로 온전히 표현되지 않을 수 있습니다.'
-            : undefined,
+        updatedText = {
+          ...updatedText,
+          [pageNum]: {
+            pageNumber: pageNum,
+            printedPageLabel:
+              ocrRes.printedPageCandidate?.trim() || updatedMapping[pageNum] || String(pageNum),
+            text: cleanText,
+            charCount: cleanText.length,
+            isLowText: cleanText.length < 35,
+            ocrApplied: true,
+            visualWarning: ocrRes.hasIncompleteVisuals
+              ? ocrRes.visualWarning || '그림·도표 일부가 텍스트로 온전히 표현되지 않을 수 있습니다.'
+              : undefined,
+          },
         };
         if (ocrRes.printedPageCandidate?.trim()) {
-          updatedMapping[pageNum] = ocrRes.printedPageCandidate.trim();
+          updatedMapping = {
+            ...updatedMapping,
+            [pageNum]: ocrRes.printedPageCandidate.trim(),
+          };
         }
-        if (cleanText.length < 35 || ocrRes.hasIncompleteVisuals) {
-          remainingWarnings.push(pageNum);
+        if (cleanText.length >= 35 && !ocrRes.hasIncompleteVisuals) {
+          remainingSet.delete(pageNum);
+        }
+
+        // Save each page incrementally so partial OCR progress is never lost on 429/network error
+        await saveTextbook({
+          ...tb,
+          pageText: updatedText,
+          pageNumberMapping: updatedMapping,
+          scanWarnings: Array.from(remainingSet).sort((a, b) => a - b),
+        });
+        processedCount++;
+
+        if (i < pagesToOcr.length - 1) {
+          await new Promise((r) => setTimeout(r, 300));
         }
       }
 
-      const nextWarnings = Array.from(
-        new Set([...tb.scanWarnings.filter((p) => !pagesToOcr.includes(p)), ...remainingWarnings])
-      ).sort((a, b) => a - b);
-
-      await saveTextbook({
-        ...tb,
-        pageText: updatedText,
-        pageNumberMapping: updatedMapping,
-        scanWarnings: nextWarnings,
-      });
       await onRefreshData();
+      const leftCount = remainingSet.size;
       setStatusMsg(
-        `'${tb.title}' 스캔 페이지 ${pagesToOcr.length}쪽의 AI 텍스트 인식이 완료되었습니다.`
+        leftCount > 0
+          ? `'${tb.title}' ${processedCount}쪽 AI OCR 완료. 아직 확인/인식이 필요한 페이지가 ${leftCount}쪽 남아 있습니다.`
+          : `'${tb.title}' 스캔 페이지 ${processedCount}쪽의 AI 텍스트 인식이 모두 완료되었습니다.`
       );
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : '스캔 OCR 처리 중 오류가 발생했습니다.');
+      if (processedCount > 0) {
+        await onRefreshData();
+      }
+      const msg = err instanceof Error ? err.message : '스캔 OCR 처리 중 오류가 발생했습니다.';
+      setErrorMsg(
+        processedCount > 0
+          ? `${processedCount}쪽까지 저장된 후 중단되었습니다: ${msg}`
+          : msg
+      );
     } finally {
       setOcrLoadingId(null);
       setOcrProgress(null);
@@ -203,7 +225,8 @@ export function TextbookManagerView({
       pageText: nextPageText,
     });
     await onRefreshData();
-    setStatusMsg(`'${tb.title}'의 인쇄 쪽수 보정(+${newOffset})이 저장되었습니다.`);
+    const signedOffset = newOffset >= 0 ? `+${newOffset}` : `${newOffset}`;
+    setStatusMsg(`'${tb.title}'의 인쇄 쪽수 보정(${signedOffset})이 저장되었습니다.`);
   }
 
   async function handleDelete(tbId: string) {
@@ -269,8 +292,13 @@ export function TextbookManagerView({
             </label>
             <input
               type="number"
-              value={pageOffset}
-              onChange={(e) => setPageOffset(Number(e.target.value) || 0)}
+              value={pageOffsetInput}
+              onChange={(e) => setPageOffsetInput(e.target.value)}
+              onBlur={() => {
+                if (pageOffsetInput.trim() === '' || !Number.isFinite(Number(pageOffsetInput))) {
+                  setPageOffsetInput('0');
+                }
+              }}
               className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 tabular-nums focus:border-blue-600 focus:outline-none"
             />
             <p className="mt-1 text-xs text-slate-500">
@@ -361,7 +389,9 @@ export function TextbookManagerView({
                       <h3 className="truncate text-base font-semibold text-slate-900">{tb.title}</h3>
                       <p className="text-xs text-slate-500 tabular-nums">
                         {tb.subject} · {tb.fileName} · 총 {tb.totalPages}쪽 · 등록일 {dateText}
-                        {tb.pageNumberOffset !== 0 ? ` · 인쇄 쪽수 +${tb.pageNumberOffset} 보정` : ''}
+                        {tb.pageNumberOffset !== 0
+                          ? ` · 인쇄 쪽수 ${tb.pageNumberOffset > 0 ? `+${tb.pageNumberOffset}` : tb.pageNumberOffset} 보정`
+                          : ''}
                       </p>
                       {tb.scanWarnings.length > 0 && (
                         <div className="mt-1.5 flex items-center gap-1.5 text-xs text-amber-700">
@@ -401,14 +431,16 @@ export function TextbookManagerView({
                         <span>쪽수 보정</span>
                         <input
                           type="number"
+                          disabled={isOcrRunning}
                           defaultValue={tb.pageNumberOffset}
                           onBlur={(e) => {
-                            const val = Number(e.target.value) || 0;
-                            if (val !== tb.pageNumberOffset) {
+                            const raw = e.target.value.trim();
+                            const val = raw === '' ? 0 : Math.trunc(Number(raw));
+                            if (Number.isFinite(val) && val !== tb.pageNumberOffset) {
                               void handleUpdateOffset(tb, val);
                             }
                           }}
-                          className="w-16 rounded border border-slate-300 px-2 py-1 text-xs tabular-nums"
+                          className="w-16 rounded border border-slate-300 px-2 py-1 text-xs tabular-nums disabled:opacity-50"
                         />
                       </label>
 
@@ -424,8 +456,9 @@ export function TextbookManagerView({
                         <div className="flex items-center gap-1.5">
                           <button
                             type="button"
+                            disabled={isOcrRunning}
                             onClick={() => void handleDelete(tb.id)}
-                            className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700 whitespace-nowrap"
+                            className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700 disabled:opacity-50 whitespace-nowrap"
                           >
                             삭제 확인
                           </button>
@@ -440,9 +473,10 @@ export function TextbookManagerView({
                       ) : (
                         <button
                           type="button"
+                          disabled={isOcrRunning}
                           onClick={() => setConfirmDeleteId(tb.id)}
                           aria-label={`${tb.title} 삭제`}
-                          className="rounded-lg border border-slate-200 p-1.5 text-slate-500 hover:border-red-200 hover:bg-red-50 hover:text-red-600"
+                          className="rounded-lg border border-slate-200 p-1.5 text-slate-500 hover:border-red-200 hover:bg-red-50 hover:text-red-600 disabled:opacity-40"
                         >
                           <Trash2 className="h-4 w-4" />
                         </button>

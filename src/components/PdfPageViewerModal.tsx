@@ -10,12 +10,31 @@ interface PdfPageViewerModalProps {
 }
 
 export function PdfPageViewerModal({ textbook, initialPage, onClose }: PdfPageViewerModalProps) {
+  const maxPage = Math.max(1, textbook.totalPages);
   const [pageNumber, setPageNumber] = useState(
-    Math.min(Math.max(1, initialPage), textbook.totalPages)
+    Math.min(Math.max(1, initialPage), maxPage)
   );
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPageNumber(Math.min(Math.max(1, initialPage), Math.max(1, textbook.totalPages)));
+  }, [initialPage, textbook.totalPages]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      } else if (e.key === 'ArrowLeft') {
+        setPageNumber((p) => Math.max(1, p - 1));
+      } else if (e.key === 'ArrowRight') {
+        setPageNumber((p) => Math.min(Math.max(1, textbook.totalPages), p + 1));
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose, textbook.totalPages]);
 
   useEffect(() => {
     let cancelled = false;

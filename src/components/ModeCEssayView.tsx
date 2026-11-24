@@ -8,9 +8,16 @@ import type {
   QuestionDifficulty,
   Textbook,
 } from '../types/study';
-import { generateVerifiedQuestions, gradeEssayWithAI } from '../lib/api';
-import { recordAttemptAndProgress, saveAttempt, saveQuestions } from '../lib/db';
+import { explainWrongAnswerWithAI, generateVerifiedQuestions, gradeEssayWithAI } from '../lib/api';
+import {
+  recordAttemptAndProgress,
+  saveAttempt,
+  saveQuestions,
+  updateAttemptOverrideAndSyncProgress,
+} from '../lib/db';
+import { isEssayQuestion } from '../lib/grading';
 import { PdfPageViewerModal } from './PdfPageViewerModal';
+import { WrongAnswerAiCard } from './WrongAnswerAiCard';
 
 interface ModeCEssayViewProps {
   scopes: ExamScope[];
@@ -42,20 +49,21 @@ export function ModeCEssayView({
   const [draftAnswers, setDraftAnswers] = useState<Record<string, string>>({});
   const [overrideScoreInput, setOverrideScoreInput] = useState<Record<string, string>>({});
   const [overrideReasonInput, setOverrideReasonInput] = useState<Record<string, string>>({});
+  const [explainingId, setExplainingId] = useState<string | null>(null);
+  const [explainErrors, setExplainErrors] = useState<Record<string, string>>({});
   const [viewerPage, setViewerPage] = useState<number | null>(null);
 
   const essayQuestions = useMemo(
-    () =>
-      scope
-        ? questions.filter((q) => q.scopeId === scope.id && q.type === '서술형')
-        : [],
+    () => (scope ? questions.filter((q) => q.scopeId === scope.id && isEssayQuestion(q)) : []),
     [questions, scope]
   );
 
-  const latestAttemptByQ = useMemo(() => {
-    const map = new Map<string, Attempt>();
+  const attemptsByQ = useMemo(() => {
+    const map = new Map<string, Attempt[]>();
     for (const a of attempts) {
-      if (!map.has(a.questionId)) map.set(a.questionId, a);
+      const list = map.get(a.questionId) || [];
+      list.push(a);
+      map.set(a.questionId, list);
     }
     return map;
   }, [attempts]);
@@ -106,11 +114,46 @@ export function ModeCEssayView({
     }
   }
 
+  async function runWrongExplanation(
+    q: Question,
+    targetAttempt: Attempt,
+    subjectName: string,
+    revealCorrectAnswer: boolean
+  ) {
+    setExplainingId(q.id);
+    setExplainErrors((prev) => {
+      const next = { ...prev };
+      delete next[q.id];
+      return next;
+    });
+    try {
+      const wrongAnalysis = await explainWrongAnswerWithAI({
+        subject: subjectName,
+        question: q,
+        userAnswer: targetAttempt.userAnswer,
+        revealCorrectAnswer,
+      });
+      await saveAttempt({
+        ...targetAttempt,
+        wrongAnalysis,
+      });
+      await onRefreshData();
+    } catch (err) {
+      setExplainErrors((prev) => ({
+        ...prev,
+        [q.id]: err instanceof Error ? err.message : '오답 원인 분석 중 오류가 발생했습니다.',
+      }));
+    } finally {
+      setExplainingId((curr) => (curr === q.id ? null : curr));
+    }
+  }
+
   async function handleGrade(q: Question) {
     if (!scope || !textbook) return;
     const answer = (draftAnswers[q.id] || '').trim();
     if (!answer) return;
 
+    const priorCount = (attemptsByQ.get(q.id) || []).length;
     setGradingId(q.id);
     setErrorMsg(null);
 
@@ -146,6 +189,11 @@ export function ModeCEssayView({
 
       await recordAttemptAndProgress(attempt, scope.subject);
       await onRefreshData();
+
+      if (!attempt.isCorrect) {
+        const revealNow = priorCount + 1 >= 2;
+        void runWrongExplanation(q, attempt, scope.subject, revealNow);
+      }
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : '서술형 채점 중 오류가 발생했습니다.');
     } finally {
@@ -154,7 +202,12 @@ export function ModeCEssayView({
   }
 
   async function handleSaveOverride(attempt: Attempt) {
-    const rawScore = Number(overrideScoreInput[attempt.questionId]);
+    const rawText = overrideScoreInput[attempt.questionId];
+    if (rawText === undefined || rawText.trim() === '') {
+      setErrorMsg('수정할 점수를 숫자로 입력한 뒤 반영 버튼을 눌러 주세요.');
+      return;
+    }
+    const rawScore = Number(rawText);
     if (!Number.isFinite(rawScore)) return;
     const clamped = Math.max(0, Math.min(attempt.maxPoints, rawScore));
     const reason = (overrideReasonInput[attempt.questionId] || '').trim() || '학생 수동 점수 보정';
@@ -165,7 +218,9 @@ export function ModeCEssayView({
       manualOverrideReason: reason,
       isCorrect: clamped >= attempt.maxPoints * 0.65,
     };
-    await saveAttempt(updated);
+    setErrorMsg(null);
+    await updateAttemptOverrideAndSyncProgress(updated, attempt.subject);
+    setOverrideScoreInput((prev) => ({ ...prev, [attempt.questionId]: '' }));
     await onRefreshData();
   }
 
@@ -242,7 +297,10 @@ export function ModeCEssayView({
       ) : (
         <div className="space-y-6">
           {essayQuestions.map((q, idx) => {
-            const attempt = latestAttemptByQ.get(q.id);
+            const qAttempts = attemptsByQ.get(q.id) || [];
+            const attempt = qAttempts[0];
+            const attemptCount = qAttempts.length;
+            const shouldRevealAnswer = Boolean(attempt && (attempt.isCorrect || attemptCount >= 2));
             const draft = draftAnswers[q.id] ?? attempt?.userAnswer ?? '';
             const fb = attempt?.feedback;
             const displayScore =
@@ -254,10 +312,11 @@ export function ModeCEssayView({
               <div key={q.id} className="rounded-xl border border-slate-200 bg-white p-6">
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
                   <div className="text-xs text-slate-500 tabular-nums">
-                    서술형 {idx + 1} · {q.difficulty} · 배점 {q.points}점 · {q.conceptTags.join(', ')}
+                    서술형 {idx + 1} · {q.difficulty} · 배점 {q.points}점
+                    {attempt && q.conceptTags.length > 0 ? ` · ${q.conceptTags.join(', ')}` : ''}
                   </div>
                   <div className="flex items-center gap-3">
-                    {q.sourcePages.length > 0 && (
+                    {attempt && q.sourcePages.length > 0 && (
                       <button
                         type="button"
                         onClick={() => setViewerPage(q.sourcePages[0])}
@@ -289,22 +348,6 @@ export function ModeCEssayView({
                   </div>
                 )}
 
-                {q.rubric && q.rubric.length > 0 && (
-                  <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-4">
-                    <p className="text-xs font-semibold text-slate-700">문항 채점 기준표</p>
-                    <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
-                      {q.rubric.map((r, rIdx) => (
-                        <div key={rIdx} className="text-xs text-slate-600">
-                          <span className="font-semibold text-slate-800">
-                            {r.criterion} ({r.maxPoints}점)
-                          </span>
-                          : {r.description}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
                 <div className="mt-4">
                   <div className="flex items-center justify-between text-xs text-slate-500">
                     <label className="font-semibold text-slate-700">학생 서술 답안 작성</label>
@@ -316,7 +359,7 @@ export function ModeCEssayView({
                     onChange={(e) =>
                       setDraftAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))
                     }
-                    placeholder="핵심 개념, 인과관계, 교과서 근거 조건을 빠짐없이 포함해 서술하세요."
+                    placeholder="배운 내용을 바탕으로 자신의 서술형 답안을 작성하세요."
                     className="mt-1.5 w-full rounded-lg border border-slate-300 px-4 py-3 text-sm leading-relaxed focus:border-blue-600 focus:outline-none"
                   />
                   <div className="mt-3 flex justify-end">
@@ -326,12 +369,18 @@ export function ModeCEssayView({
                       onClick={() => void handleGrade(q)}
                       className="rounded-lg bg-slate-900 px-5 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
                     >
-                      {gradingId === q.id ? '루브릭 AI 채점 중...' : 'AI 서술형 채점 받기'}
+                      {gradingId === q.id
+                        ? 'AI 채점 중...'
+                        : attempt && !shouldRevealAnswer
+                        ? '2차 답안 채점 받기 (모범 답안 공개)'
+                        : attempt
+                        ? '다시 채점 받기'
+                        : 'AI 서술형 채점 받기'}
                     </button>
                   </div>
                 </div>
 
-                {/* Essay Grading Report */}
+                {/* Essay Grading Report — Hints & Rubric Criteria shown ONLY AFTER grading */}
                 {attempt && fb && (
                   <div className="mt-6 space-y-5 border-t border-slate-200 pt-6">
                     <div className="flex flex-col justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900 sm:flex-row sm:items-center">
@@ -340,12 +389,12 @@ export function ModeCEssayView({
                         <span>{fb.disclaimer}</span>
                       </div>
                       <div className="font-mono-num text-base font-bold text-slate-900 whitespace-nowrap shrink-0">
-                        예상 점수 {displayScore} / {fb.maxPoints}점
+                        예상 점수 {displayScore} / {fb.maxPoints}점 ({attemptCount}차 시도)
                         {attempt.manualOverridePoints !== undefined && ' (수동 보정됨)'}
                       </div>
                     </div>
 
-                    {/* Rubric Criteria Table */}
+                    {/* Rubric Criteria Table (revealed only after grading) */}
                     <div className="overflow-x-auto rounded-lg border border-slate-200">
                       <table className="w-full text-left text-xs">
                         <thead className="border-b border-slate-200 bg-slate-50 text-slate-600">
@@ -396,12 +445,34 @@ export function ModeCEssayView({
                             ? fb.missingConcepts.join(', ')
                             : '핵심 개념이 대부분 포함되었습니다.'}
                         </p>
-                        <p className="mt-3 font-semibold text-slate-900">답안 개선 방향</p>
+                        <p className="mt-3 font-semibold text-slate-900">채점 후 답안 개선 힌트</p>
                         <p className="mt-1 text-slate-700">{fb.improvementDirection}</p>
-                        <p className="mt-3 font-semibold text-blue-700">모범 답안</p>
-                        <p className="mt-1 text-slate-800">{fb.modelAnswer}</p>
+                        {shouldRevealAnswer ? (
+                          <>
+                            <p className="mt-3 font-semibold text-blue-700">모범 답안</p>
+                            <p className="mt-1 text-slate-800">{fb.modelAnswer}</p>
+                          </>
+                        ) : (
+                          <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-2.5 text-amber-900">
+                            1차 채점에서는 모범 답안이 비공개됩니다. 위 채점 결과와 오답 원인을
+                            참고해 보완한 뒤 <strong>2차 답안</strong>을 제출하면 모범 답안이
+                            공개됩니다.
+                          </div>
+                        )}
                       </div>
                     </div>
+
+                    {!attempt.isCorrect && (
+                      <WrongAnswerAiCard
+                        analysis={attempt.wrongAnalysis}
+                        loading={explainingId === q.id}
+                        error={explainErrors[q.id]}
+                        revealCorrectAnswer={shouldRevealAnswer}
+                        onRequestExplain={() =>
+                          void runWrongExplanation(q, attempt, scope.subject, shouldRevealAnswer)
+                        }
+                      />
+                    )}
 
                     {/* Manual Score Override / Dispute */}
                     <div className="flex flex-col gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3.5 sm:flex-row sm:items-center">

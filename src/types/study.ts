@@ -9,6 +9,7 @@ export type QuestionType =
 export type QuestionDifficulty = '기본' | '심화' | '최상위';
 export type ClozeDifficulty = '쉬움' | '보통' | '어려움';
 export type ExamDifficulty = '기본형' | '일반 내신형' | '상위권 심화형' | '최상위 고난도형';
+export type StudyModeKey = 'cloze' | 'questions' | 'essay' | 'exam';
 
 export interface PageTextEntry {
   pageNumber: number; // 1-indexed PDF physical page
@@ -113,6 +114,18 @@ export interface EssayGradingFeedback {
   disclaimer: string;
 }
 
+export interface WrongAnswerSource {
+  title: string;
+  uri: string;
+}
+
+export interface WrongAnswerAnalysis {
+  whyWrong: string;
+  retryHint: string;
+  sources?: WrongAnswerSource[];
+  generatedAt: number;
+}
+
 export interface Attempt {
   id: string;
   questionId: string;
@@ -127,6 +140,7 @@ export interface Attempt {
   earnedPoints: number;
   maxPoints: number;
   feedback?: EssayGradingFeedback;
+  wrongAnalysis?: WrongAnswerAnalysis;
   manualOverridePoints?: number;
   manualOverrideReason?: string;
   isRetest: boolean;

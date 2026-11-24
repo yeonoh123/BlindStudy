@@ -111,7 +111,16 @@ export async function loadAllData() {
 
 export async function saveTextbook(textbook: Textbook) {
   const db = await getDb();
-  await db.put('textbooks', textbook);
+  try {
+    await db.put('textbooks', textbook);
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'QuotaExceededError') {
+      throw new Error(
+        '브라우저 저장 공간(IndexedDB)이 부족하여 교과서를 저장할 수 없습니다. 기존 교과서를 삭제하거나 더 작은 PDF를 사용해 주세요.'
+      );
+    }
+    throw err;
+  }
 }
 
 export async function deleteTextbookCascade(textbookId: string) {
@@ -165,7 +174,45 @@ export async function saveScope(scope: ExamScope) {
 
 export async function deleteScope(scopeId: string) {
   const db = await getDb();
-  await db.delete('scopes', scopeId);
+  const tx = db.transaction(
+    ['scopes', 'questions', 'attempts', 'clozeCards', 'examSessions', 'learningProgress', 'meta'],
+    'readwrite'
+  );
+  await tx.objectStore('scopes').delete(scopeId);
+
+  const [questions, attempts, cloze, sessions, progress] = await Promise.all([
+    tx.objectStore('questions').getAll(),
+    tx.objectStore('attempts').getAll(),
+    tx.objectStore('clozeCards').getAll(),
+    tx.objectStore('examSessions').getAll(),
+    tx.objectStore('learningProgress').getAll(),
+  ]);
+
+  let remainingAttempts = 0;
+  for (const q of questions) {
+    if (q.scopeId === scopeId) await tx.objectStore('questions').delete(q.id);
+  }
+  for (const a of attempts) {
+    if (a.scopeId === scopeId) {
+      await tx.objectStore('attempts').delete(a.id);
+    } else {
+      remainingAttempts++;
+    }
+  }
+  for (const c of cloze) {
+    if (c.scopeId === scopeId) await tx.objectStore('clozeCards').delete(c.id);
+  }
+  for (const e of sessions) {
+    if (e.scopeId === scopeId) await tx.objectStore('examSessions').delete(e.id);
+  }
+  for (const p of progress) {
+    if (p.scopeId === scopeId) await tx.objectStore('learningProgress').delete(p.id);
+  }
+  if (remainingAttempts === 0) {
+    await tx.objectStore('meta').delete('latestWeaknessAnalysis');
+  }
+
+  await tx.done;
 }
 
 export async function saveQuestions(questions: Question[]) {
@@ -246,49 +293,120 @@ export function computeAdaptiveDifficulty(
   };
 }
 
+async function rebuildProgressForConcept(
+  db: IDBPDatabase<BlindStudySchema>,
+  scopeId: string,
+  subject: string,
+  conceptName: string,
+  allAttemptsForScope: Attempt[]
+): Promise<LearningProgress | null> {
+  const matching = allAttemptsForScope
+    .filter((a) => {
+      const tags = a.conceptTags.length > 0 ? a.conceptTags : [a.unitName || '일반 개념'];
+      return tags.includes(conceptName);
+    })
+    .sort((a, b) => a.submittedAt - b.submittedAt);
+
+  const key = `${scopeId}::${conceptName}`;
+  if (matching.length === 0) {
+    await db.delete('learningProgress', key);
+    return null;
+  }
+
+  let recommended: QuestionDifficulty = matching[0].difficulty;
+  let adjustmentReason = '초기 학습 단계입니다.';
+  const recentResults: boolean[] = [];
+  const essayScores: number[] = [];
+
+  for (const att of matching) {
+    recentResults.push(att.isCorrect);
+    if (recentResults.length > 10) recentResults.shift();
+    if ((att.type === '서술형' || Boolean(att.feedback)) && att.maxPoints > 0) {
+      const pts = att.manualOverridePoints ?? att.earnedPoints;
+      essayScores.push(pts / att.maxPoints);
+      if (essayScores.length > 10) essayScores.shift();
+    }
+    const next = computeAdaptiveDifficulty(recentResults, recommended);
+    recommended = next.recommendedDifficulty;
+    adjustmentReason = next.adjustmentReason;
+  }
+
+  const nextProgress: LearningProgress = {
+    id: key,
+    scopeId,
+    subject,
+    conceptName,
+    attemptedCount: matching.length,
+    correctCount: matching.filter((a) => a.isCorrect).length,
+    recentResults,
+    essayScores,
+    recommendedDifficulty: recommended,
+    adjustmentReason,
+    lastReviewedAt: matching[matching.length - 1].submittedAt,
+  };
+  await db.put('learningProgress', nextProgress);
+  return nextProgress;
+}
+
 export async function recordAttemptAndProgress(
   attempt: Attempt,
   subject: string
 ): Promise<LearningProgress[]> {
+  return recordAttemptsBatchAndProgress([attempt], subject);
+}
+
+export async function recordAttemptsBatchAndProgress(
+  newAttempts: Attempt[],
+  subject: string
+): Promise<LearningProgress[]> {
+  if (newAttempts.length === 0) return [];
   const db = await getDb();
-  await db.put('attempts', attempt);
-
-  const tags = attempt.conceptTags.length > 0 ? attempt.conceptTags : [attempt.unitName || '일반 개념'];
-  const updatedList: LearningProgress[] = [];
-
-  for (const conceptName of tags) {
-    const key = `${attempt.scopeId}::${conceptName}`;
-    const existing = await db.get('learningProgress', key);
-    const prevResults = existing?.recentResults ?? [];
-    const recentResults = [...prevResults, attempt.isCorrect].slice(-10);
-    const essayRatio = attempt.maxPoints > 0 ? attempt.earnedPoints / attempt.maxPoints : 0;
-    const essayScores =
-      attempt.type === '서술형'
-        ? [...(existing?.essayScores ?? []), essayRatio].slice(-10)
-        : existing?.essayScores ?? [];
-
-    const { recommendedDifficulty, adjustmentReason } = computeAdaptiveDifficulty(
-      recentResults,
-      existing?.recommendedDifficulty ?? attempt.difficulty
-    );
-
-    const nextProgress: LearningProgress = {
-      id: key,
-      scopeId: attempt.scopeId,
-      subject,
-      conceptName,
-      attemptedCount: (existing?.attemptedCount ?? 0) + 1,
-      correctCount: (existing?.correctCount ?? 0) + (attempt.isCorrect ? 1 : 0),
-      recentResults,
-      essayScores,
-      recommendedDifficulty,
-      adjustmentReason,
-      lastReviewedAt: attempt.submittedAt,
-    };
-    await db.put('learningProgress', nextProgress);
-    updatedList.push(nextProgress);
+  for (const att of newAttempts) {
+    await db.put('attempts', att);
   }
 
+  const scopeId = newAttempts[0].scopeId;
+  const allAttempts = (await db.getAll('attempts')).filter((a) => a.scopeId === scopeId);
+  const conceptSet = new Set<string>();
+  for (const att of newAttempts) {
+    const tags = att.conceptTags.length > 0 ? att.conceptTags : [att.unitName || '일반 개념'];
+    for (const t of tags) conceptSet.add(t);
+  }
+
+  const updatedList: LearningProgress[] = [];
+  for (const conceptName of conceptSet) {
+    const rebuilt = await rebuildProgressForConcept(db, scopeId, subject, conceptName, allAttempts);
+    if (rebuilt) updatedList.push(rebuilt);
+  }
+
+  return updatedList;
+}
+
+export async function updateAttemptOverrideAndSyncProgress(
+  updatedAttempt: Attempt,
+  subject: string
+): Promise<LearningProgress[]> {
+  const db = await getDb();
+  await db.put('attempts', updatedAttempt);
+  const allAttempts = (await db.getAll('attempts')).filter(
+    (a) => a.scopeId === updatedAttempt.scopeId
+  );
+  const tags =
+    updatedAttempt.conceptTags.length > 0
+      ? updatedAttempt.conceptTags
+      : [updatedAttempt.unitName || '일반 개념'];
+
+  const updatedList: LearningProgress[] = [];
+  for (const conceptName of tags) {
+    const rebuilt = await rebuildProgressForConcept(
+      db,
+      updatedAttempt.scopeId,
+      subject,
+      conceptName,
+      allAttempts
+    );
+    if (rebuilt) updatedList.push(rebuilt);
+  }
   return updatedList;
 }
 

@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Eye, FileWarning, Plus, Sparkles, Trash2 } from 'lucide-react';
-import type { ConceptItem, ExamScope, PageTextEntry, Textbook } from '../types/study';
-import type { StudyModeKey } from './DashboardView';
+import type { ConceptItem, ExamScope, PageTextEntry, StudyModeKey, Textbook } from '../types/study';
 import { analyzeScopeChunked } from '../lib/api';
 import { deleteScope, saveScope } from '../lib/db';
 import { PdfPageViewerModal } from './PdfPageViewerModal';
@@ -28,14 +27,19 @@ export function ScopeSetupView({
 
   const [scopeName, setScopeName] = useState('2학기 중간고사');
   const [unitNameInput, setUnitNameInput] = useState('');
-  const [startPage, setStartPage] = useState(1);
-  const [endPage, setEndPage] = useState(selectedTb ? Math.min(10, selectedTb.totalPages) : 1);
+  const [startPageInput, setStartPageInput] = useState('1');
+  const [endPageInput, setEndPageInput] = useState(
+    selectedTb ? String(Math.min(10, selectedTb.totalPages)) : '1'
+  );
+  const startPage = Math.max(1, Math.min(Number(startPageInput) || 1, selectedTb?.totalPages || 1));
+  const endPage = Math.max(startPage, Math.min(Number(endPageInput) || startPage, selectedTb?.totalPages || 1));
 
   const [analyzing, setAnalyzing] = useState(false);
   const [chunkProgress, setChunkProgress] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const [activeScope, setActiveScope] = useState<ExamScope | null>(scopes[0] || null);
+  const [activeScopeId, setActiveScopeId] = useState<string | null>(scopes[0]?.id || null);
+  const activeScope = scopes.find((s) => s.id === activeScopeId) || scopes[0] || null;
   const [newConceptName, setNewConceptName] = useState('');
   const [newConceptSummary, setNewConceptSummary] = useState('');
   const [previewTarget, setPreviewTarget] = useState<{ textbook: Textbook; page: number } | null>(
@@ -47,8 +51,8 @@ export function ScopeSetupView({
       setSelectedTbId(preselectedTextbookId);
       const tb = textbooks.find((t) => t.id === preselectedTextbookId);
       if (tb) {
-        setStartPage(1);
-        setEndPage(Math.min(10, tb.totalPages));
+        setStartPageInput('1');
+        setEndPageInput(String(Math.min(10, tb.totalPages)));
       }
     }
   }, [preselectedTextbookId, textbooks]);
@@ -56,8 +60,8 @@ export function ScopeSetupView({
   useEffect(() => {
     if (!selectedTb && textbooks.length > 0) {
       setSelectedTbId(textbooks[0].id);
-      setStartPage(1);
-      setEndPage(Math.min(10, textbooks[0].totalPages));
+      setStartPageInput('1');
+      setEndPageInput(String(Math.min(10, textbooks[0].totalPages)));
     }
   }, [textbooks, selectedTb]);
 
@@ -67,10 +71,10 @@ export function ScopeSetupView({
       return;
     }
 
-    const s = Math.max(1, Math.min(startPage, selectedTb.totalPages));
-    const e = Math.max(s, Math.min(endPage, selectedTb.totalPages));
-    setStartPage(s);
-    setEndPage(e);
+    const s = Math.max(1, Math.min(Number(startPageInput) || 1, selectedTb.totalPages));
+    const e = Math.max(s, Math.min(Number(endPageInput) || s, selectedTb.totalPages));
+    setStartPageInput(String(s));
+    setEndPageInput(String(e));
 
     const pages: PageTextEntry[] = [];
     for (let p = s; p <= e; p++) {
@@ -90,9 +94,9 @@ export function ScopeSetupView({
           scopeName: scopeName.trim() || `${selectedTb.subject} ${s}~${e}쪽`,
           pages,
         },
-        (idx, total) => {
+        (completed, total) => {
           setChunkProgress(
-            total > 1 ? `긴 범위 분할 분석 중 (${idx}/${total} 구간)...` : 'AI 핵심 개념 추출 중...'
+            total > 1 ? `범위 병렬 분할 분석 중 (${completed}/${total} 구간 완료)...` : 'AI 핵심 개념 추출 중...'
           );
         }
       );
@@ -121,8 +125,8 @@ export function ScopeSetupView({
       };
 
       await saveScope(newScope);
+      setActiveScopeId(newScope.id);
       await onRefreshData();
-      setActiveScope(newScope);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : '시험 범위 분석에 실패했습니다.');
     } finally {
@@ -139,7 +143,6 @@ export function ScopeSetupView({
         c.id === conceptId ? { ...c, excluded: !c.excluded } : c
       ),
     };
-    setActiveScope(updated);
     await saveScope(updated);
     await onRefreshData();
   }
@@ -156,7 +159,6 @@ export function ScopeSetupView({
         c.id === conceptId ? { ...c, [field]: value } : c
       ),
     };
-    setActiveScope(updated);
     await saveScope(updated);
     await onRefreshData();
   }
@@ -176,7 +178,6 @@ export function ScopeSetupView({
       ...activeScope,
       extractedConcepts: [item, ...activeScope.extractedConcepts],
     };
-    setActiveScope(updated);
     setNewConceptName('');
     setNewConceptSummary('');
     await saveScope(updated);
@@ -185,8 +186,8 @@ export function ScopeSetupView({
 
   async function handleDeleteScope(scopeId: string) {
     await deleteScope(scopeId);
-    if (activeScope?.id === scopeId) {
-      setActiveScope(null);
+    if (activeScopeId === scopeId) {
+      setActiveScopeId(null);
     }
     await onRefreshData();
   }
@@ -196,7 +197,7 @@ export function ScopeSetupView({
       <div className="rounded-xl border border-slate-200 bg-white p-10 text-center">
         <h2 className="text-lg font-semibold text-slate-900">등록된 교과서가 없습니다</h2>
         <p className="mt-2 text-sm text-slate-600">
-          시험 범위를 설정하려면 먼저 교과서 관리 탭에서 PDF 교과서를 업로드해 주세요.
+          시험 범위를 설정하려면 먼저 PDF · 범위 설정 탭에서 PDF 교과서를 업로드해 주세요.
         </p>
       </div>
     );
@@ -229,8 +230,8 @@ export function ScopeSetupView({
                 const tb = textbooks.find((t) => t.id === e.target.value);
                 setSelectedTbId(e.target.value);
                 if (tb) {
-                  setStartPage(1);
-                  setEndPage(Math.min(10, tb.totalPages));
+                  setStartPageInput('1');
+                  setEndPageInput(String(Math.min(10, tb.totalPages)));
                 }
               }}
               className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-600 focus:outline-none"
@@ -261,8 +262,9 @@ export function ScopeSetupView({
                 type="number"
                 min={1}
                 max={selectedTb?.totalPages || 1}
-                value={startPage}
-                onChange={(e) => setStartPage(Number(e.target.value) || 1)}
+                value={startPageInput}
+                onChange={(e) => setStartPageInput(e.target.value)}
+                onBlur={() => setStartPageInput(String(startPage))}
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm tabular-nums focus:border-blue-600 focus:outline-none"
               />
               {selectedTb && (
@@ -290,8 +292,9 @@ export function ScopeSetupView({
                 type="number"
                 min={startPage}
                 max={selectedTb?.totalPages || 1}
-                value={endPage}
-                onChange={(e) => setEndPage(Number(e.target.value) || startPage)}
+                value={endPageInput}
+                onChange={(e) => setEndPageInput(e.target.value)}
+                onBlur={() => setEndPageInput(String(endPage))}
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm tabular-nums focus:border-blue-600 focus:outline-none"
               />
               {selectedTb && (
@@ -375,7 +378,7 @@ export function ScopeSetupView({
                   >
                     <button
                       type="button"
-                      onClick={() => setActiveScope(sc)}
+                      onClick={() => setActiveScopeId(sc.id)}
                       className="min-w-0 flex-1 text-left"
                     >
                       <p className="truncate text-sm font-semibold text-slate-900">{sc.name}</p>

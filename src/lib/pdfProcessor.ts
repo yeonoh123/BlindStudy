@@ -13,7 +13,26 @@ function resolvePublicAssetUrl(relativePath: string): string {
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = resolvePublicAssetUrl('pdf.worker.min.mjs');
 
+function formatPdfLoadError(err: unknown, fallbackMsg: string): Error {
+  const name = err instanceof Error ? err.name : '';
+  const msg = err instanceof Error ? err.message : fallbackMsg;
+  if (name === 'PasswordException' || msg.toLowerCase().includes('password')) {
+    return new Error('암호로 보호된 PDF 파일입니다. 암호를 해제한 뒤 다시 업로드해 주세요.');
+  }
+  if (name === 'InvalidPDFException' || msg.toLowerCase().includes('invalid pdf')) {
+    return new Error('올바른 PDF 파일 형식이 아니거나 파일이 손상되었습니다.');
+  }
+  if (name === 'MissingPDFException') {
+    return new Error('PDF 파일 데이터를 읽을 수 없습니다.');
+  }
+  return err instanceof Error ? err : new Error(msg);
+}
+
 async function openPdfDocument(pdfBuffer: ArrayBuffer) {
+  if (!pdfBuffer || pdfBuffer.byteLength === 0) {
+    throw new Error('빈 파일입니다. 내용이 있는 PDF 파일을 선택해 주세요.');
+  }
+
   const docOptions = {
     cMapUrl: resolvePublicAssetUrl('pdfjs/cmaps/'),
     cMapPacked: true,
@@ -27,6 +46,10 @@ async function openPdfDocument(pdfBuffer: ArrayBuffer) {
     const pdf = await loadingTask.promise;
     return { loadingTask, pdf };
   } catch (primaryErr) {
+    const errName = primaryErr instanceof Error ? primaryErr.name : '';
+    if (errName === 'PasswordException' || errName === 'InvalidPDFException') {
+      throw formatPdfLoadError(primaryErr, 'PDF 파일을 열 수 없습니다.');
+    }
     const errMsg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
     console.warn('[BlindStudy PDF] 기본 Web Worker 로딩 실패, 번들 워커 핸들러로 재시도합니다:', errMsg);
 
@@ -47,7 +70,7 @@ async function openPdfDocument(pdfBuffer: ArrayBuffer) {
         primaryError: primaryErr,
         fallbackError: fallbackErr,
       });
-      throw fallbackErr instanceof Error ? fallbackErr : new Error(errMsg);
+      throw formatPdfLoadError(fallbackErr, errMsg);
     }
   }
 }
@@ -66,6 +89,11 @@ export async function extractPdfPages(
 ): Promise<ExtractedPdfResult> {
   const { loadingTask, pdf } = await openPdfDocument(pdfBuffer);
   const totalPages = pdf.numPages;
+
+  if (totalPages <= 0) {
+    await loadingTask.destroy();
+    throw new Error('페이지가 없는 PDF 파일입니다.');
+  }
 
   const pageText: Record<number, PageTextEntry> = {};
   const pageNumberMapping: Record<number, string> = {};

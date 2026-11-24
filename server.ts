@@ -9,6 +9,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const MODEL_NAME = 'gemini-4-hydrogen';
+const FAST_MODEL = 'gemini-3.1-flash-lite';
 
 function getAiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -33,11 +34,18 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
     } catch (err: unknown) {
       lastError = err;
       const status = (err as { status?: number })?.status;
-      const isRetryable = status === 429 || (typeof status === 'number' && status >= 500);
-      if (!isRetryable || attempt === maxRetries) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const is429 = status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
+      const is5xx =
+        (typeof status === 'number' && status >= 500) ||
+        msg.includes('503') ||
+        msg.includes('UNAVAILABLE');
+      if ((!is429 && !is5xx) || attempt === maxRetries) {
         break;
       }
-      await new Promise((r) => setTimeout(r, 700 * Math.pow(2, attempt)));
+      const baseMs = is429 ? 1100 : 600;
+      const delayMs = baseMs * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
+      await new Promise((r) => setTimeout(r, delayMs));
     }
   }
   throw lastError;
@@ -91,6 +99,17 @@ function safeJsonParse<T>(raw: string | undefined, fallbackLabel: string): T {
   }
 }
 
+function maskSensitivePii(input: string): string {
+  if (!input) return '';
+  return input
+    .replace(/\b\d{6}-[1-4]\d{6}\b/g, '[주민등록번호 보호됨]')
+    .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[이메일 보호됨]')
+    .replace(
+      /(?:^|[^\d-])(0(?:1[016789]|2|[3-6][1-5]|70)-\d{3,4}-\d{4})(?!\d)/g,
+      (match, num: string) => match.replace(num, '[연락처 보호됨]')
+    );
+}
+
 interface InputPage {
   pageNumber: number;
   printedPageLabel?: string;
@@ -104,7 +123,8 @@ function sanitizePages(rawPages: unknown): InputPage[] {
     if (!item || typeof item !== 'object') continue;
     const p = item as Record<string, unknown>;
     const pageNumber = Number(p.pageNumber);
-    const text = typeof p.text === 'string' ? p.text.trim() : '';
+    const rawText = typeof p.text === 'string' ? p.text.trim() : '';
+    const text = maskSensitivePii(rawText);
     const printedPageLabel =
       typeof p.printedPageLabel === 'string' ? p.printedPageLabel : String(pageNumber);
     if (Number.isFinite(pageNumber) && pageNumber > 0) {
@@ -114,19 +134,216 @@ function sanitizePages(rawPages: unknown): InputPage[] {
   return valid;
 }
 
-function buildTextbookContext(pages: InputPage[]): string {
-  return pages
-    .filter((p) => p.text.length > 0)
-    .map(
-      (p) =>
-        `[PDF ${p.pageNumber}쪽 / 인쇄 ${p.printedPageLabel ?? p.pageNumber}쪽]\n${p.text}`
-    )
+function buildTextbookContext(
+  pages: InputPage[],
+  maxTotalChars = 46000,
+  preferredPageNumbers?: number[]
+): string {
+  const nonEmpty = pages.filter((p) => p.text.length > 0);
+  if (nonEmpty.length === 0) return '';
+
+  const totalChars = nonEmpty.reduce((sum, p) => sum + p.text.length, 0);
+  let selected = nonEmpty;
+
+  if (totalChars > maxTotalChars && nonEmpty.length > 12) {
+    const preferredSet = new Set(preferredPageNumbers || []);
+    const mustKeep = nonEmpty.filter((p) => preferredSet.has(p.pageNumber));
+    const others = nonEmpty.filter((p) => !preferredSet.has(p.pageNumber));
+
+    // Sample evenly across remaining pages so the entire exam range stays represented
+    const maxPagesCount = 24;
+    const slotsLeft = Math.max(0, maxPagesCount - mustKeep.length);
+    const sampled: InputPage[] = [...mustKeep];
+    if (slotsLeft > 0 && others.length > 0) {
+      const step = Math.max(1, Math.ceil(others.length / slotsLeft));
+      for (let i = 0; i < others.length && sampled.length < maxPagesCount; i += step) {
+        sampled.push(others[i]);
+      }
+    }
+    selected = sampled.sort((a, b) => a.pageNumber - b.pageNumber);
+  }
+
+  const perPageCap = Math.max(1200, Math.floor(maxTotalChars / Math.max(1, selected.length)));
+  return selected
+    .map((p) => {
+      const body = p.text.length > perPageCap ? `${p.text.slice(0, perPageCap)}…` : p.text;
+      return `[PDF ${p.pageNumber}쪽 / 인쇄 ${p.printedPageLabel ?? p.pageNumber}쪽]\n${body}`;
+    })
     .join('\n\n---\n\n');
+}
+
+function resolvePdfPageNumbers(rawNums: number[] | undefined, submittedPages: InputPage[]): number[] {
+  if (submittedPages.length === 0) return [];
+  const validSet = new Set(submittedPages.map((p) => p.pageNumber));
+  const printedMap = new Map<string, number>();
+  for (const p of submittedPages) {
+    if (p.printedPageLabel) {
+      printedMap.set(p.printedPageLabel.trim(), p.pageNumber);
+    }
+  }
+
+  const resolved: number[] = [];
+  for (const num of rawNums || []) {
+    const n = Number(num);
+    if (!Number.isFinite(n)) continue;
+    if (validSet.has(n)) {
+      resolved.push(n);
+    } else {
+      const mapped = printedMap.get(String(Math.round(n)));
+      if (mapped !== undefined) {
+        resolved.push(mapped);
+      }
+    }
+  }
+  const unique = Array.from(new Set(resolved)).sort((a, b) => a - b);
+  return unique.length > 0 ? unique : [submittedPages[0].pageNumber];
+}
+
+const CANONICAL_QUESTION_TYPES = [
+  '5지선다형',
+  'OX',
+  '단답형',
+  '서술형',
+  '자료해석형',
+  '복합개념추론형',
+] as const;
+
+type CanonicalQuestionType = (typeof CANONICAL_QUESTION_TYPES)[number];
+type CanonicalDifficulty = '기본' | '심화' | '최상위';
+
+function normalizeQuestionType(rawType: string | undefined, hasChoices: boolean): CanonicalQuestionType {
+  const t = (rawType || '').trim();
+  const exact = CANONICAL_QUESTION_TYPES.find((c) => c === t);
+  if (exact) return exact;
+
+  const lower = t.toLowerCase();
+  if (lower.includes('ox') || lower.includes('o/x')) return 'OX';
+  if (t.includes('서술') || t.includes('논술')) return '서술형';
+  if (t.includes('단답') || t.includes('주관')) return '단답형';
+  if (t.includes('자료')) return '자료해석형';
+  if (t.includes('복합') || t.includes('추론')) return '복합개념추론형';
+  if (t.includes('선다') || t.includes('객관') || hasChoices) return '5지선다형';
+  return '단답형';
+}
+
+function normalizeQuestionDifficulty(
+  rawDiff: string | undefined,
+  requestedDiff: string | undefined
+): CanonicalDifficulty {
+  const candidates = [rawDiff, requestedDiff];
+  for (const cand of candidates) {
+    const d = (cand || '').trim();
+    if (!d) continue;
+    if (d === '최상위' || d.includes('최상위') || d.includes('고난도')) return '최상위';
+    if (d === '심화' || d.includes('심화') || d.includes('일반 내신')) return '심화';
+    if (d === '기본' || d.includes('기본')) return '기본';
+  }
+  return '심화';
+}
+
+function stripChoiceLabelPrefix(s: string): string {
+  return s.replace(/^(?:[1-5][.)]\s*|[①②③④⑤]\s*)/, '').trim();
+}
+
+function cleanChoiceLabels(
+  choices: string[],
+  resolvedAnswer: string
+): { choices: string[]; resolvedAnswer: string } {
+  if (choices.length < 2) return { choices, resolvedAnswer };
+  const prefixRe = /^(?:[1-5][.)]\s*|[①②③④⑤]\s*)/;
+  if (!choices.every((c) => prefixRe.test(c.trim()))) {
+    return { choices, resolvedAnswer };
+  }
+  const strippedChoices = choices.map((c) => stripChoiceLabelPrefix(c));
+  const allNonEmpty = strippedChoices.every((c) => c.length > 0);
+  const allUnique = new Set(strippedChoices).size === strippedChoices.length;
+  if (!allNonEmpty || !allUnique) {
+    return { choices, resolvedAnswer };
+  }
+  const ansIdx = choices.findIndex((c) => c === resolvedAnswer);
+  const nextAns = ansIdx >= 0 ? strippedChoices[ansIdx] : stripChoiceLabelPrefix(resolvedAnswer);
+  return { choices: strippedChoices, resolvedAnswer: nextAns };
+}
+
+function normalizeChoiceAnswer(
+  finalAnswer: string,
+  choices: string[],
+  questionType: string
+): { normalizedChoices: string[]; resolvedAnswer: string | null } {
+  if (questionType === 'OX') {
+    const oxChoices = ['O', 'X'];
+    const trimmed = finalAnswer.trim().toLowerCase();
+    if (
+      trimmed === 'o' ||
+      trimmed.startsWith('o ') ||
+      trimmed.startsWith('o(') ||
+      trimmed === '참' ||
+      trimmed === '맞음' ||
+      trimmed === 'true' ||
+      trimmed === '1'
+    ) {
+      return { normalizedChoices: oxChoices, resolvedAnswer: 'O' };
+    }
+    if (
+      trimmed === 'x' ||
+      trimmed.startsWith('x ') ||
+      trimmed.startsWith('x(') ||
+      trimmed === '거짓' ||
+      trimmed === '틀림' ||
+      trimmed === 'false' ||
+      trimmed === '2'
+    ) {
+      return { normalizedChoices: oxChoices, resolvedAnswer: 'X' };
+    }
+    return { normalizedChoices: oxChoices, resolvedAnswer: null };
+  }
+
+  const trimmedAns = finalAnswer.trim();
+  const exact = choices.find((c) => c === finalAnswer || c.trim() === trimmedAns);
+  if (exact) {
+    const cleaned = cleanChoiceLabels(choices, exact);
+    return { normalizedChoices: cleaned.choices, resolvedAnswer: cleaned.resolvedAnswer };
+  }
+
+  // Strip optional leading numbering like "1. " or "① " when comparing
+  const strippedAns = stripChoiceLabelPrefix(trimmedAns);
+  const byStripped = choices.find((c) => stripChoiceLabelPrefix(c) === strippedAns);
+  if (byStripped) {
+    const cleaned = cleanChoiceLabels(choices, byStripped);
+    return { normalizedChoices: cleaned.choices, resolvedAnswer: cleaned.resolvedAnswer };
+  }
+
+  // Only treat as 1-based index if the entire answer is explicitly an index token (not "3권 분립")
+  const explicitIdxMatch = trimmedAns.match(/^(?:([1-5])번?\.?\)?)$/);
+  const circledMap: Record<string, number> = { '①': 1, '②': 2, '③': 3, '④': 4, '⑤': 5 };
+  const explicitIdx = explicitIdxMatch ? Number(explicitIdxMatch[1]) : circledMap[trimmedAns];
+  if (explicitIdx && explicitIdx >= 1 && explicitIdx <= choices.length) {
+    const cleaned = cleanChoiceLabels(choices, choices[explicitIdx - 1]);
+    return { normalizedChoices: cleaned.choices, resolvedAnswer: cleaned.resolvedAnswer };
+  }
+
+  const fuzzyMatches = choices.filter(
+    (c) =>
+      strippedAns.length >= 2 &&
+      (c.toLowerCase().includes(strippedAns.toLowerCase()) ||
+        strippedAns.toLowerCase().includes(stripChoiceLabelPrefix(c).toLowerCase()))
+  );
+  if (fuzzyMatches.length === 1) {
+    const cleaned = cleanChoiceLabels(choices, fuzzyMatches[0]);
+    return { normalizedChoices: cleaned.choices, resolvedAnswer: cleaned.resolvedAnswer };
+  }
+
+  return { normalizedChoices: choices, resolvedAnswer: null };
 }
 
 async function createAppServer() {
   const app = express();
   app.use(express.json({ limit: '15mb' }));
+  app.use('/api', (_req: Request, res: Response, next: express.NextFunction) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.setHeader('Pragma', 'no-cache');
+    next();
+  });
 
   app.get('/api/health', (_req: Request, res: Response) => {
     const key = process.env.GEMINI_API_KEY;
@@ -134,6 +351,7 @@ async function createAppServer() {
       ok: true,
       configured: Boolean(key && key !== 'MY_GEMINI_API_KEY'),
       model: MODEL_NAME,
+      fastModel: FAST_MODEL,
     });
   });
 
@@ -152,44 +370,76 @@ async function createAppServer() {
         return;
       }
 
-      const allowedMime = mimeType === 'image/jpeg' || mimeType === 'image/png' ? mimeType : 'image/png';
-      const base64Clean = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+      const dataUriMatch = imageBase64.match(/^data:(image\/(?:png|jpeg|webp));base64,/i);
+      const allowedMime =
+        mimeType === 'image/jpeg' || mimeType === 'image/png' || mimeType === 'image/webp'
+          ? mimeType
+          : dataUriMatch
+          ? dataUriMatch[1].toLowerCase()
+          : 'image/png';
+      const base64Clean = imageBase64.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '').trim();
+
+      if (!base64Clean || base64Clean.length < 32) {
+        res.status(400).json({ error: '유효한 이미지 base64 데이터가 아닙니다.' });
+        return;
+      }
 
       const ai = getAiClient();
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: MODEL_NAME,
-          contents: {
-            parts: [
-              {
-                inlineData: {
-                  mimeType: allowedMime,
-                  data: base64Clean,
-                },
-              },
-              {
-                text: `이 이미지는 한국 학교 교과서(${subject || '일반 과목'}) PDF ${pageNumber ?? ''}쪽입니다.
-페이지에 포함된 본문, 제목, 소제목, 도표 텍스트, 캡션을 빠짐없이 한국어로 정확히 텍스트 추출하세요.
-만약 복잡한 그림·그래프·지도·도표 등이 있어 텍스트만으로 온전히 설명할 수 없는 시각 자료가 있다면 hasIncompleteVisuals를 true로 두고 visualWarning에 어떤 부분이 불완전할 수 있는지 구체적으로 안내하세요.`,
-              },
-            ],
+      const ocrConfig = {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            extractedText: { type: Type.STRING },
+            printedPageCandidate: { type: Type.STRING },
+            hasIncompleteVisuals: { type: Type.BOOLEAN },
+            visualWarning: { type: Type.STRING },
           },
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                extractedText: { type: Type.STRING },
-                printedPageCandidate: { type: Type.STRING },
-                hasIncompleteVisuals: { type: Type.BOOLEAN },
-                visualWarning: { type: Type.STRING },
-              },
-              required: ['extractedText', 'hasIncompleteVisuals'],
+          required: ['extractedText', 'hasIncompleteVisuals'],
+        },
+      };
+      const ocrContents = {
+        parts: [
+          {
+            inlineData: {
+              mimeType: allowedMime,
+              data: base64Clean,
             },
           },
-        })
-      );
+          {
+            text: `이 이미지는 한국 학교 교과서(${subject || '일반 과목'}) PDF ${pageNumber ?? ''}쪽입니다.
+페이지에 포함된 본문, 제목, 소제목, 도표 텍스트, 캡션을 빠짐없이 한국어로 정확히 텍스트 추출하세요.
+만약 복잡한 그림·그래프·지도·도표 등이 있어 텍스트만으로 온전히 설명할 수 없는 시각 자료가 있다면 hasIncompleteVisuals를 true로 두고 visualWarning에 어떤 부분이 불완전할 수 있는지 구체적으로 안내하세요.`,
+          },
+        ],
+      };
+
+      const response = await withRetry(async () => {
+        try {
+          return await ai.models.generateContent({
+            model: FAST_MODEL,
+            contents: ocrContents,
+            config: {
+              ...ocrConfig,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+            },
+          });
+        } catch (err: unknown) {
+          const code = (err as { status?: number })?.status;
+          const msg = err instanceof Error ? err.message : String(err);
+          if (code === 404 || msg.includes('NOT_FOUND')) {
+            return await ai.models.generateContent({
+              model: MODEL_NAME,
+              contents: ocrContents,
+              config: {
+                ...ocrConfig,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              },
+            });
+          }
+          throw err;
+        }
+      });
 
       const parsed = safeJsonParse<{
         extractedText: string;
@@ -198,7 +448,10 @@ async function createAppServer() {
         visualWarning?: string;
       }>(response.text, '스캔 페이지 텍스트 추출');
 
-      res.json(parsed);
+      res.json({
+        ...parsed,
+        extractedText: maskSensitivePii(parsed.extractedText || ''),
+      });
     } catch (err: unknown) {
       const formatted = formatAiError(err);
       res.status(formatted.status).json({ error: formatted.message });
@@ -220,75 +473,97 @@ async function createAppServer() {
       if (nonEmptyPages.length === 0) {
         res.status(400).json({
           error:
-            '선택한 범위에서 분석 가능한 교과서 텍스트를 찾지 못했습니다. 스캔본이라면 교과서 관리 화면에서 AI 스캔 OCR을 먼저 실행해 주세요.',
+            '선택한 범위에서 분석 가능한 교과서 텍스트를 찾지 못했습니다. 스캔본이라면 PDF · 범위 설정 화면에서 AI 스캔 OCR을 먼저 실행해 주세요.',
         });
         return;
       }
 
-      const contextText = buildTextbookContext(nonEmptyPages);
+      const contextText = buildTextbookContext(nonEmptyPages, 28000);
       const ai = getAiClient();
 
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: MODEL_NAME,
-          contents: `과목: ${subject || '미지정'}
-시험명/범위명: ${scopeName || '시험 범위'}
+      const analyzeContents = `과목: ${maskSensitivePii(subject || '미지정')}
+시험명/범위명: ${maskSensitivePii(scopeName || '시험 범위')}
 
-아래는 학생이 업로드한 교과서의 실제 텍스트입니다. 반드시 아래 텍스트에 실제로 등장하는 내용만 근거로 분석하세요. 외부 지식을 임의로 추가하지 마세요.
+아래 교과서 텍스트에 실제로 등장하는 내용만 근거로 빠르게 핵심 개념을 추출하세요.
 
-${contextText}`,
-          config: {
-            systemInstruction: `당신은 한국 중·고등학교 내신 교과서 분석 전문가입니다.
-1. 제공된 교과서 텍스트에서 단원(소단원/주제) 흐름을 파악하세요.
-2. 내신 시험에 출제될 핵심 개념, 용어, 사건, 원리를 추출하고 각 개념이 등장하는 PDF 쪽수(sourcePages)를 정확히 연결하세요.
-3. 표, 그래프, 그림 설명이 빠져 있거나 텍스트가 불완전해 보이는 페이지가 있다면 warnings 배열에 명확히 경고하세요.`,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
+${contextText}`;
+      const analyzeSystem = `당신은 한국 중·고등학교 내신 교과서 분석 전문가입니다.
+1. 제공된 교과서 텍스트에서 주요 단원(소단원/주제) 구간을 파악하세요.
+2. 시험 출제 핵심 개념 5~12개를 간결하게 추출하고, summary는 1~2문장으로 핵심만 요약하며 실제 PDF 쪽수(sourcePages)를 연결하세요.
+3. 표, 그래프, 그림이 빠져 텍스트가 불완전해 보이는 페이지가 있을 때만 warnings에 짧게 경고하세요.`;
+      const analyzeSchema = {
+        type: Type.OBJECT,
+        properties: {
+          units: {
+            type: Type.ARRAY,
+            items: {
               type: Type.OBJECT,
               properties: {
-                units: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      unitName: { type: Type.STRING },
-                      startPage: { type: Type.INTEGER },
-                      endPage: { type: Type.INTEGER },
-                    },
-                    required: ['unitName', 'startPage', 'endPage'],
-                  },
-                },
-                concepts: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING },
-                      unitName: { type: Type.STRING },
-                      summary: { type: Type.STRING },
-                      sourcePages: {
-                        type: Type.ARRAY,
-                        items: { type: Type.INTEGER },
-                      },
-                      importance: {
-                        type: Type.STRING,
-                        description: '핵심, 심화, 보조 중 하나',
-                      },
-                    },
-                    required: ['name', 'unitName', 'summary', 'sourcePages', 'importance'],
-                  },
-                },
-                warnings: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                },
+                unitName: { type: Type.STRING },
+                startPage: { type: Type.INTEGER },
+                endPage: { type: Type.INTEGER },
               },
-              required: ['units', 'concepts', 'warnings'],
+              required: ['unitName', 'startPage', 'endPage'],
             },
           },
-        })
-      );
+          concepts: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                name: { type: Type.STRING },
+                unitName: { type: Type.STRING },
+                summary: { type: Type.STRING },
+                sourcePages: {
+                  type: Type.ARRAY,
+                  items: { type: Type.INTEGER },
+                },
+                importance: {
+                  type: Type.STRING,
+                  description: '핵심, 심화, 보조 중 하나',
+                },
+              },
+              required: ['name', 'unitName', 'summary', 'sourcePages', 'importance'],
+            },
+          },
+          warnings: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+          },
+        },
+        required: ['units', 'concepts', 'warnings'],
+      };
+
+      const response = await withRetry(async () => {
+        try {
+          return await ai.models.generateContent({
+            model: FAST_MODEL,
+            contents: analyzeContents,
+            config: {
+              systemInstruction: analyzeSystem,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+              responseMimeType: 'application/json',
+              responseSchema: analyzeSchema,
+            },
+          });
+        } catch (err: unknown) {
+          const code = (err as { status?: number })?.status;
+          const msg = err instanceof Error ? err.message : String(err);
+          if (code === 404 || msg.includes('NOT_FOUND')) {
+            return await ai.models.generateContent({
+              model: MODEL_NAME,
+              contents: analyzeContents,
+              config: {
+                systemInstruction: analyzeSystem,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                responseMimeType: 'application/json',
+                responseSchema: analyzeSchema,
+              },
+            });
+          }
+          throw err;
+        }
+      });
 
       const parsed = safeJsonParse<{
         units: Array<{ unitName: string; startPage: number; endPage: number }>;
@@ -302,7 +577,30 @@ ${contextText}`,
         warnings: string[];
       }>(response.text, '시험 범위 분석');
 
-      res.json(parsed);
+      const validPageNums = nonEmptyPages.map((p) => p.pageNumber);
+      const minPage = Math.min(...validPageNums);
+      const maxPage = Math.max(...validPageNums);
+
+      const normalizedUnits = (parsed.units || []).map((u) => {
+        const s = resolvePdfPageNumbers([u.startPage], nonEmptyPages)[0];
+        const e = resolvePdfPageNumbers([u.endPage], nonEmptyPages)[0];
+        return {
+          unitName: u.unitName || '핵심 단원',
+          startPage: Math.min(s, e),
+          endPage: Math.max(minPage, Math.min(maxPage, Math.max(s, e))),
+        };
+      });
+
+      const normalizedConcepts = (parsed.concepts || []).map((c) => ({
+        ...c,
+        sourcePages: resolvePdfPageNumbers(c.sourcePages, nonEmptyPages),
+      }));
+
+      res.json({
+        units: normalizedUnits,
+        concepts: normalizedConcepts,
+        warnings: parsed.warnings || [],
+      });
     } catch (err: unknown) {
       const formatted = formatAiError(err);
       res.status(formatted.status).json({ error: formatted.message });
@@ -326,9 +624,10 @@ ${contextText}`,
         return;
       }
 
-      const targetCount = Math.min(Math.max(Number(count) || 10, 4), 20);
+      const targetCount = Math.min(Math.max(Number(count) || 10, 1), 20);
       const diff = difficulty || '보통';
-      const contextText = buildTextbookContext(pages);
+      const preferredPages = (concepts || []).flatMap((c) => c.sourcePages || []);
+      const contextText = buildTextbookContext(pages, 22000, preferredPages);
       const conceptList = (concepts || [])
         .map((c) => `- ${c.name} (근거 ${c.sourcePages.join(', ')}쪽): ${c.summary}`)
         .join('\n');
@@ -341,10 +640,7 @@ ${contextText}`,
           : '여러 개념의 관계나 핵심 논리를 스스로 떠올려야 하는 긴 구절 빈칸 또는 짧은 서술형 확인 질문(shortQuestion)을 함께 출제하세요.';
 
       const ai = getAiClient();
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: MODEL_NAME,
-          contents: `과목: ${subject || '미지정'}
+      const clozeContents = `과목: ${subject || '미지정'}
 난이도: ${diff}
 목표 카드 수: ${targetCount}개
 기준: ${diffRule}
@@ -353,49 +649,76 @@ ${contextText}`,
 ${conceptList || '교과서 본문 전체에서 주요 개념을 선정하세요.'}
 
 [교과서 본문]
-${contextText}`,
-          config: {
-            systemInstruction: `당신은 한국 고등학생을 위한 내신 암기장 제작 AI입니다.
+${contextText}`;
+      const clozeSystem = `당신은 한국 고등학생을 위한 내신 암기장 제작 AI입니다.
 반드시 제공된 교과서 본문에 실제로 있는 내용과 쪽수만 사용하여 빈칸 암기 카드를 생성하세요.
 promptBefore + [빈칸: blankAnswer] + promptAfter가 자연스러운 한 문장(fullSentence)이 되어야 합니다.
-근거가 부족하면 억지로 카드를 채우지 말고 정확한 카드만 생성하세요.`,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
+근거가 부족하면 억지로 카드를 채우지 말고 정확한 카드만 생성하세요.`;
+      const clozeSchema = {
+        type: Type.OBJECT,
+        properties: {
+          cards: {
+            type: Type.ARRAY,
+            items: {
               type: Type.OBJECT,
               properties: {
-                cards: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      conceptName: { type: Type.STRING },
-                      promptBefore: { type: Type.STRING },
-                      blankAnswer: { type: Type.STRING },
-                      promptAfter: { type: Type.STRING },
-                      fullSentence: { type: Type.STRING },
-                      hint: { type: Type.STRING },
-                      shortQuestion: { type: Type.STRING },
-                      sourcePage: { type: Type.INTEGER },
-                    },
-                    required: [
-                      'conceptName',
-                      'promptBefore',
-                      'blankAnswer',
-                      'promptAfter',
-                      'fullSentence',
-                      'hint',
-                      'sourcePage',
-                    ],
-                  },
-                },
-                notice: { type: Type.STRING },
+                conceptName: { type: Type.STRING },
+                promptBefore: { type: Type.STRING },
+                blankAnswer: { type: Type.STRING },
+                promptAfter: { type: Type.STRING },
+                fullSentence: { type: Type.STRING },
+                hint: { type: Type.STRING },
+                shortQuestion: { type: Type.STRING },
+                sourcePage: { type: Type.INTEGER },
               },
-              required: ['cards'],
+              required: [
+                'conceptName',
+                'promptBefore',
+                'blankAnswer',
+                'promptAfter',
+                'fullSentence',
+                'hint',
+                'sourcePage',
+              ],
             },
           },
-        })
-      );
+          notice: { type: Type.STRING },
+        },
+        required: ['cards'],
+      };
+
+      const response = await withRetry(async () => {
+        try {
+          return await ai.models.generateContent({
+            model: FAST_MODEL,
+            contents: clozeContents,
+            config: {
+              systemInstruction: clozeSystem,
+              thinkingConfig: {
+                thinkingLevel: diff === '어려움' ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL,
+              },
+              responseMimeType: 'application/json',
+              responseSchema: clozeSchema,
+            },
+          });
+        } catch (err: unknown) {
+          const code = (err as { status?: number })?.status;
+          const msg = err instanceof Error ? err.message : String(err);
+          if (code === 404 || msg.includes('NOT_FOUND')) {
+            return await ai.models.generateContent({
+              model: MODEL_NAME,
+              contents: clozeContents,
+              config: {
+                systemInstruction: clozeSystem,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                responseMimeType: 'application/json',
+                responseSchema: clozeSchema,
+              },
+            });
+          }
+          throw err;
+        }
+      });
 
       const parsed = safeJsonParse<{
         cards: Array<{
@@ -411,7 +734,18 @@ promptBefore + [빈칸: blankAnswer] + promptAfter가 자연스러운 한 문장
         notice?: string;
       }>(response.text, '빈칸 암기장 생성');
 
-      res.json(parsed);
+      const validCards = (parsed.cards || [])
+        .filter((c) => c.blankAnswer?.trim() && (c.promptBefore?.trim() || c.promptAfter?.trim()))
+        .map((c) => ({
+          ...c,
+          blankAnswer: c.blankAnswer.trim(),
+          sourcePage: resolvePdfPageNumbers([c.sourcePage], pages)[0],
+        }));
+
+      res.json({
+        cards: validCards,
+        notice: parsed.notice,
+      });
     } catch (err: unknown) {
       const formatted = formatAiError(err);
       res.status(formatted.status).json({ error: formatted.message });
@@ -468,7 +802,8 @@ promptBefore + [빈칸: blankAnswer] + promptAfter가 자연스러운 한 문장
         return;
       }
 
-      const contextText = buildTextbookContext(pages);
+      const preferredPages = (concepts || []).flatMap((c) => c.sourcePages || []);
+      const contextText = buildTextbookContext(pages, 14000, preferredPages);
       const conceptList = (concepts || [])
         .map((c) => `- [${c.unitName}] ${c.name} (${c.sourcePages.join(', ')}쪽): ${c.summary}`)
         .join('\n');
@@ -480,9 +815,9 @@ promptBefore + [빈칸: blankAnswer] + promptAfter가 자연스러운 한 문장
 
       const existingText =
         existingStems && existingStems.length > 0
-          ? `[이미 출제된 문제 목록 - 절대 동일하거나 유사한 표현으로 반복 출제 금지]\n${existingStems
-              .slice(-25)
-              .map((s, i) => `${i + 1}. ${s}`)
+          ? `[이미 출제된 문제 - 중복 금지]\n${existingStems
+              .slice(-12)
+              .map((s, i) => `${i + 1}. ${s.slice(0, 90)}`)
               .join('\n')}`
           : '';
 
@@ -496,20 +831,15 @@ promptBefore + [빈칸: blankAnswer] + promptAfter가 자연스러운 한 문장
               .join('\n')}`
           : '';
 
-      const diffGuide =
-        difficulty === '최상위' || difficulty === '최상위 고난도형'
-          ? '최상위 난이도: 문장 길이만 늘리지 말고, (1) 여러 개념 연결, (2) 원인-결과 추론, (3) 유사 개념 변별, (4) 제시된 자료/사례 해석, (5) 복수 조건 동시 충족을 요구하는 고난도 사고력 문제로 출제하세요.'
-          : difficulty === '심화' || difficulty === '상위권 심화형'
-          ? '심화 난이도: 두 개 이상의 개념을 비교하거나 원인과 결과를 추론하여 정답을 도출하는 문제를 출제하세요.'
-          : '기본 난이도: 교과서 핵심 개념과 용어를 정확히 이해했는지 확인하는 명료한 내신 문제를 출제하세요.';
+      const isHighestTier = difficulty === '최상위' || difficulty === '최상위 고난도형';
+      const diffGuide = isHighestTier
+        ? '최상위 난이도: 문장 길이만 늘리지 말고, (1) 여러 개념 연결, (2) 원인-결과 추론, (3) 유사 개념 변별, (4) 제시된 자료/사례 해석, (5) 복수 조건 동시 충족을 요구하는 고난도 사고력 문제로 출제하세요.'
+        : difficulty === '심화' || difficulty === '상위권 심화형'
+        ? '심화 난이도: 두 개 이상의 개념을 비교하거나 원인과 결과를 추론하여 정답을 도출하는 문제를 출제하세요.'
+        : '기본 난이도: 교과서 핵심 개념과 용어를 정확히 이해했는지 확인하는 명료한 내신 문제를 출제하세요.';
 
       const ai = getAiClient();
-
-      // Step 1: Generate candidate questions strictly grounded in textbook text
-      const genResponse = await withRetry(() =>
-        ai.models.generateContent({
-          model: MODEL_NAME,
-          contents: `과목: ${subject || '미지정'}
+      const genContents = `과목: ${subject || '미지정'}
 시험 범위: ${scopeName || '선택 범위'}
 목표 난이도: ${difficulty || '심화'}
 목표 총점: ${totalPointsTarget || totalRequested * 5}점
@@ -530,74 +860,104 @@ ${weakFocusText}
 ${existingText}
 
 [교과서 본문 (반드시 이 내용만을 근거로 출제)]
-${contextText}`,
-          config: {
-            systemInstruction: `당신은 한국 중·고등학교 내신 출제위원입니다.
+${contextText}`;
+
+      const genSystem = `당신은 한국 중·고등학교 내신 출제위원입니다.
 절대 원칙:
 1. 업로드된 교과서 본문 범위 밖의 사실을 정답 근거로 사용하지 마세요.
-2. 근거가 부족하면 문항 수를 억지로 채우지 말고 verifiedNotice에 이유를 밝히며 근거 있는 문제만 반환하세요.
-3. 5지선다형/자료해석형(객관식 선택 시)/복합개념추론형(객관식 선택 시)의 객관식 보기는 정확히 5개(choices 배열 길이 5)여야 하며, 정답은 오직 1개만 성립해야 합니다. correctAnswer는 정답 보기의 정확한 텍스트(또는 '1'~'5'가 아닌 보기 내용과 일치하는 문자열)로 작성하되, 가장 명확하도록 정답 보기 문자열 그대로 적으세요.
+2. 근거가 부족하면 문항 수를 억지로 채우지 말고 insufficientEvidenceNotice에 이유를 밝히며 근거 있는 문제만 반환하세요.
+3. 5지선다형/자료해석형(객관식 선택 시)/복합개념추론형(객관식 선택 시)의 객관식 보기는 정확히 5개(choices 배열 길이 5)여야 하며, 정답은 오직 1개만 성립해야 합니다. correctAnswer는 정답 보기 문자열 그대로 작성하세요.
 4. OX 유형은 choices를 ["O", "X"], correctAnswer를 "O" 또는 "X"로 작성하세요.
 5. 단답형은 모호하지 않은 명확한 핵심 단어를 correctAnswer로 지정하세요.
-6. 서술형(또는 서술형으로 출제된 자료해석/복합추론)은 반드시 구체적인 rubric(평가 기준명, 세부 설명, 배점 합계=points)과 교과서에 근거한 모범 답안(correctAnswer)을 포함하세요.
-7. 모든 문항에는 실제 PDF 페이지 번호 배열(sourcePages)과 교과서 본문에서 직접 발췌한 근거 문장(sourceQuote)을 반드시 포함하세요.
-8. ${includeExplanations === false ? '해설(explanation)은 간단히 근거만 요약하세요.' : '해설(explanation)에는 정답 이유와 오답 보기가 틀린 이유를 교과서 근거와 함께 상세히 설명하세요.'}`,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
-            responseMimeType: 'application/json',
-            responseSchema: {
+6. 서술형(또는 서술형으로 출제된 자료해석/복합추론)은 구체적인 rubric(배점 합계=points)과 모범 답안(correctAnswer)을 포함하세요.
+7. 모든 문항에는 실제 PDF 페이지 번호 배열(sourcePages)과 본문에서 직접 발췌한 짧은 근거 문장 1개(sourceQuote, 20~70자)를 포함하세요.
+8. ${includeExplanations === false ? '해설(explanation)은 1문장으로 간결하게 요약하세요.' : '해설(explanation)은 정답 근거와 핵심 포인트를 1~2문장으로 명료하게 작성하세요.'}`;
+
+      const genSchema = {
+        type: Type.OBJECT,
+        properties: {
+          questions: {
+            type: Type.ARRAY,
+            items: {
               type: Type.OBJECT,
               properties: {
-                questions: {
+                type: { type: Type.STRING },
+                difficulty: { type: Type.STRING },
+                unitName: { type: Type.STRING },
+                conceptTags: { type: Type.ARRAY, items: { type: Type.STRING } },
+                questionText: { type: Type.STRING },
+                passageOrData: { type: Type.STRING },
+                choices: { type: Type.ARRAY, items: { type: Type.STRING } },
+                correctAnswer: { type: Type.STRING },
+                explanation: { type: Type.STRING },
+                sourcePages: { type: Type.ARRAY, items: { type: Type.INTEGER } },
+                sourceQuote: { type: Type.STRING },
+                points: { type: Type.NUMBER },
+                rubric: {
                   type: Type.ARRAY,
                   items: {
                     type: Type.OBJECT,
                     properties: {
-                      type: { type: Type.STRING },
-                      difficulty: { type: Type.STRING },
-                      unitName: { type: Type.STRING },
-                      conceptTags: { type: Type.ARRAY, items: { type: Type.STRING } },
-                      questionText: { type: Type.STRING },
-                      passageOrData: { type: Type.STRING },
-                      choices: { type: Type.ARRAY, items: { type: Type.STRING } },
-                      correctAnswer: { type: Type.STRING },
-                      explanation: { type: Type.STRING },
-                      sourcePages: { type: Type.ARRAY, items: { type: Type.INTEGER } },
-                      sourceQuote: { type: Type.STRING },
-                      points: { type: Type.NUMBER },
-                      rubric: {
-                        type: Type.ARRAY,
-                        items: {
-                          type: Type.OBJECT,
-                          properties: {
-                            criterion: { type: Type.STRING },
-                            description: { type: Type.STRING },
-                            maxPoints: { type: Type.NUMBER },
-                          },
-                          required: ['criterion', 'description', 'maxPoints'],
-                        },
-                      },
+                      criterion: { type: Type.STRING },
+                      description: { type: Type.STRING },
+                      maxPoints: { type: Type.NUMBER },
                     },
-                    required: [
-                      'type',
-                      'difficulty',
-                      'unitName',
-                      'conceptTags',
-                      'questionText',
-                      'correctAnswer',
-                      'explanation',
-                      'sourcePages',
-                      'sourceQuote',
-                      'points',
-                    ],
+                    required: ['criterion', 'description', 'maxPoints'],
                   },
                 },
-                insufficientEvidenceNotice: { type: Type.STRING },
               },
-              required: ['questions'],
+              required: [
+                'type',
+                'difficulty',
+                'unitName',
+                'conceptTags',
+                'questionText',
+                'correctAnswer',
+                'explanation',
+                'sourcePages',
+                'sourceQuote',
+                'points',
+              ],
             },
           },
-        })
-      );
+          insufficientEvidenceNotice: { type: Type.STRING },
+        },
+        required: ['questions'],
+      };
+
+      // Step 1: Fast grounded question generation using gemini-3.1-flash-lite
+      const genResponse = await withRetry(async () => {
+        try {
+          return await ai.models.generateContent({
+            model: FAST_MODEL,
+            contents: genContents,
+            config: {
+              systemInstruction: genSystem,
+              thinkingConfig: {
+                thinkingLevel: isHighestTier ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL,
+              },
+              responseMimeType: 'application/json',
+              responseSchema: genSchema,
+            },
+          });
+        } catch (err: unknown) {
+          const code = (err as { status?: number })?.status;
+          const msg = err instanceof Error ? err.message : String(err);
+          if (code === 404 || msg.includes('NOT_FOUND')) {
+            return await ai.models.generateContent({
+              model: MODEL_NAME,
+              contents: genContents,
+              config: {
+                systemInstruction: genSystem,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                responseMimeType: 'application/json',
+                responseSchema: genSchema,
+              },
+            });
+          }
+          throw err;
+        }
+      });
 
       const draft = safeJsonParse<{
         questions: Array<{
@@ -627,131 +987,52 @@ ${contextText}`,
         return;
       }
 
-      // Step 2: Quality Verification Pass (PART 5)
-      let resultMap = new Map<
-        number,
-        {
-          index: number;
-          valid: boolean;
-          verificationNote: string;
-          rejectionReason?: string;
-          correctedChoices?: string[];
-          correctedAnswer?: string;
-        }
-      >();
-
-      try {
-        const verifyResponse = await withRetry(
-          () =>
-            ai.models.generateContent({
-              model: MODEL_NAME,
-              contents: `아래 생성된 문제 초안을 교과서 본문과 대조하여 품질 검증을 수행하세요.
-
-[검증 기준]
-1. 객관식(5지선다형, 자료해석형/복합개념추론형 중 choices가 있는 문항):
-   - 정답이 오직 하나만 성립하는가?
-   - 복수 정답 가능성이나 보기 간 모순은 없는가?
-   - choices 배열 중 correctAnswer와 정확히 일치하는 보기가 1개 존재하는가?
-2. 서술형:
-   - 요구 조건이 명확하고 모범 답안이 교과서와 일치하는가?
-   - rubric 배점 합이 points와 일치하는가?
-3. 공통:
-   - sourcePages와 sourceQuote가 실제 아래 교과서 본문에 존재하는가?
-   - 교과서에 없는 사실을 정답으로 요구하고 있지 않은가?
-
-검증에 통과한 문항만 valid: true로 표시하고, 경미한 형식 오류(예: 보기 일치, 배점 합 보정)가 있다면 correctedChoices/correctedAnswer로 교정하거나, 복수 정답·근거 부재처럼 치명적 결함이 있으면 valid: false로 제외하고 rejectionReason을 남기세요.
-
-[교과서 본문]
-${contextText}
-
-[생성된 문제 초안 JSON]
-${JSON.stringify(draft.questions)}`,
-              config: {
-                systemInstruction:
-                  '당신은 엄격한 내신 문항 품질 검증관입니다. 신뢰할 수 없는 문제는 과감히 제외(valid: false)하세요.',
-                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-                responseMimeType: 'application/json',
-                responseSchema: {
-                  type: Type.OBJECT,
-                  properties: {
-                    results: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          index: { type: Type.INTEGER },
-                          valid: { type: Type.BOOLEAN },
-                          verificationNote: { type: Type.STRING },
-                          rejectionReason: { type: Type.STRING },
-                          correctedChoices: { type: Type.ARRAY, items: { type: Type.STRING } },
-                          correctedAnswer: { type: Type.STRING },
-                        },
-                        required: ['index', 'valid', 'verificationNote'],
-                      },
-                    },
-                  },
-                  required: ['results'],
-                },
-              },
-            }),
-          1
-        );
-
-        const verifiedMeta = safeJsonParse<{
-          results: Array<{
-            index: number;
-            valid: boolean;
-            verificationNote: string;
-            rejectionReason?: string;
-            correctedChoices?: string[];
-            correctedAnswer?: string;
-          }>;
-        }>(verifyResponse.text, '문제 품질 검증');
-        resultMap = new Map(verifiedMeta.results.map((r) => [r.index, r]));
-      } catch (verifyErr: unknown) {
-        const vStatus = (verifyErr as { status?: number })?.status;
-        if (vStatus !== 429) {
-          throw verifyErr;
-        }
-        // If only the secondary verification call hit a 429 burst limit, proceed with deterministic server validation below
-      }
-
+      // Step 2: Fast deterministic validation & deduplication (zero extra LLM round-trip latency)
       const verifiedQuestions: Array<Record<string, unknown>> = [];
       const rejectedReasons: string[] = [];
 
       draft.questions.forEach((q, idx) => {
-        const check = resultMap.get(idx);
-        if (check && !check.valid) {
-          rejectedReasons.push(`${idx + 1}번 후보 제외: ${check.rejectionReason || check.verificationNote}`);
+        if (!q.questionText || !q.questionText.trim()) {
+          rejectedReasons.push(`${idx + 1}번 후보 제외: 문제 지문이 비어 있음`);
           return;
         }
-        const choices =
-          check?.correctedChoices && check.correctedChoices.length > 0
-            ? check.correctedChoices
-            : q.choices;
-        const correctAnswer =
-          check?.correctedAnswer && check.correctedAnswer.trim()
-            ? check.correctedAnswer
-            : q.correctAnswer;
-
-        // Deterministic checks: ensure sourceQuote & valid MC answer mapping
-        let finalAnswer = correctAnswer;
-        if (choices && choices.length > 0 && !choices.includes(finalAnswer)) {
-          const idxNum = Number(finalAnswer.replace(/[^0-9]/g, ''));
-          if (idxNum >= 1 && idxNum <= choices.length) {
-            finalAnswer = choices[idxNum - 1];
-          } else {
-            const fuzzy = choices.find((c) => c.includes(finalAnswer) || finalAnswer.includes(c));
-            if (fuzzy) {
-              finalAnswer = fuzzy;
-            } else {
-              rejectedReasons.push(`${idx + 1}번 후보 제외: 정답이 보기 목록과 일치하지 않음`);
-              return;
-            }
-          }
+        if (!q.correctAnswer || !q.correctAnswer.trim()) {
+          rejectedReasons.push(`${idx + 1}번 후보 제외: 정답이 비어 있음`);
+          return;
         }
 
-        // Normalize points to match rubric sum for essay questions
+        let choices = q.choices;
+        const canonicalType = normalizeQuestionType(
+          q.type,
+          Boolean(choices && choices.length > 0)
+        );
+        const canonicalDifficulty = normalizeQuestionDifficulty(q.difficulty, difficulty);
+
+        let finalAnswer = q.correctAnswer.trim();
+        if (canonicalType === 'OX') {
+          const oxRes = normalizeChoiceAnswer(finalAnswer, ['O', 'X'], 'OX');
+          if (!oxRes.resolvedAnswer) {
+            rejectedReasons.push(`${idx + 1}번 후보 제외: OX 정답 형식이 유효하지 않음`);
+            return;
+          }
+          choices = oxRes.normalizedChoices;
+          finalAnswer = oxRes.resolvedAnswer;
+        } else if (choices && choices.length > 0) {
+          const uniqueChoices = Array.from(new Set(choices.map((c) => c.trim()).filter(Boolean)));
+          if (uniqueChoices.length < choices.length) {
+            rejectedReasons.push(`${idx + 1}번 후보 제외: 중복된 선택지가 포함됨`);
+            return;
+          }
+          const mcRes = normalizeChoiceAnswer(finalAnswer, choices, canonicalType);
+          if (!mcRes.resolvedAnswer) {
+            rejectedReasons.push(`${idx + 1}번 후보 제외: 정답이 보기 목록과 정확히 일치하지 않음`);
+            return;
+          }
+          choices = mcRes.normalizedChoices;
+          finalAnswer = mcRes.resolvedAnswer;
+        }
+
+        const resolvedPages = resolvePdfPageNumbers(q.sourcePages, pages);
         const normalizedPoints =
           q.rubric && q.rubric.length > 0
             ? q.rubric.reduce((sum, r) => sum + Number(r.maxPoints || 0), 0) || q.points
@@ -759,12 +1040,13 @@ ${JSON.stringify(draft.questions)}`,
 
         verifiedQuestions.push({
           ...q,
+          type: canonicalType,
+          difficulty: canonicalDifficulty,
           points: normalizedPoints,
           choices: choices && choices.length > 0 ? choices : undefined,
           correctAnswer: finalAnswer,
-          sourcePages:
-            q.sourcePages && q.sourcePages.length > 0 ? q.sourcePages : [pages[0].pageNumber],
-          verificationNote: check?.verificationNote || '교과서 근거 및 형식 검증 완료',
+          sourcePages: resolvedPages,
+          verificationNote: '교과서 근거 및 단일 정답 형식 검증 완료',
         });
       });
 
@@ -851,7 +1133,7 @@ ${JSON.stringify(draft.questions)}`,
       }
 
       const pages = sanitizePages(rawPages);
-      const contextText = buildTextbookContext(pages);
+      const contextText = buildTextbookContext(pages, 16000);
       const rubricList =
         rubric && rubric.length > 0
           ? rubric
@@ -859,11 +1141,10 @@ ${JSON.stringify(draft.questions)}`,
               .join('\n')
           : `- 핵심 개념 정확성 (4점)\n- 근거 및 설명 (3점)\n- 논리적 연결 (2점)\n- 요구 조건 충족 (1점)`;
 
+      const safeUserAnswer = maskSensitivePii(userAnswer);
+
       const ai = getAiClient();
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: MODEL_NAME,
-          contents: `[문제]
+      const gradeContents = `[문제]
 ${questionText}
 ${passageOrData ? `\n[제시 자료]\n${passageOrData}` : ''}
 
@@ -878,54 +1159,80 @@ ${sourceQuote || ''}
 ${contextText ? `\n[관련 교과서 본문]\n${contextText}` : ''}
 
 [학생 답안]
-${userAnswer}`,
-          config: {
-            systemInstruction: `당신은 한국 중·고등학교 내신 서술형 채점 교사입니다.
+${safeUserAnswer}`;
+      const gradeSystem = `당신은 한국 중·고등학교 내신 서술형 채점 교사입니다.
 채점 원칙:
 1. 모범 답안과 문장이 다르더라도 의미가 정확하고 교과서 개념을 올바르게 서술했다면 정답으로 인정하세요.
 2. 답안의 길이만으로 점수를 주거나 깎지 마세요.
 3. 각 채점 기준(rubric)별로 부분 점수를 정확히 부여하고, 합계가 earnedPoints와 일치하게 계산하세요.
-4. 잘 작성한 부분(strengths), 부족한 부분(weaknesses), 누락된 핵심 개념(missingConcepts), 논리적·사실적 오류(factualOrLogicErrors), 구체적 답안 개선 방향(improvementDirection)을 친절하고 정확하게 제시하세요.`,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
-            responseMimeType: 'application/json',
-            responseSchema: {
+4. 잘 작성한 부분(strengths), 부족한 부분(weaknesses), 누락된 핵심 개념(missingConcepts), 논리적·사실적 오류(factualOrLogicErrors), 구체적 답안 개선 방향(improvementDirection)을 친절하고 정확하게 제시하세요.
+5. improvementDirection에서는 모범 답안 전체 문장을 그대로 통째로 적어주지 말고, 학생이 부족한 부분을 스스로 고쳐 2차 답안을 작성할 수 있도록 방향과 원리 중심으로 안내하세요.`;
+      const gradeSchema = {
+        type: Type.OBJECT,
+        properties: {
+          earnedPoints: { type: Type.NUMBER },
+          maxPoints: { type: Type.NUMBER },
+          criteriaScores: {
+            type: Type.ARRAY,
+            items: {
               type: Type.OBJECT,
               properties: {
-                earnedPoints: { type: Type.NUMBER },
+                criterion: { type: Type.STRING },
                 maxPoints: { type: Type.NUMBER },
-                criteriaScores: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      criterion: { type: Type.STRING },
-                      maxPoints: { type: Type.NUMBER },
-                      earnedPoints: { type: Type.NUMBER },
-                      comment: { type: Type.STRING },
-                    },
-                    required: ['criterion', 'maxPoints', 'earnedPoints', 'comment'],
-                  },
-                },
-                strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
-                weaknesses: { type: Type.ARRAY, items: { type: Type.STRING } },
-                missingConcepts: { type: Type.ARRAY, items: { type: Type.STRING } },
-                factualOrLogicErrors: { type: Type.ARRAY, items: { type: Type.STRING } },
-                improvementDirection: { type: Type.STRING },
+                earnedPoints: { type: Type.NUMBER },
+                comment: { type: Type.STRING },
               },
-              required: [
-                'earnedPoints',
-                'maxPoints',
-                'criteriaScores',
-                'strengths',
-                'weaknesses',
-                'missingConcepts',
-                'factualOrLogicErrors',
-                'improvementDirection',
-              ],
+              required: ['criterion', 'maxPoints', 'earnedPoints', 'comment'],
             },
           },
-        })
-      );
+          strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
+          weaknesses: { type: Type.ARRAY, items: { type: Type.STRING } },
+          missingConcepts: { type: Type.ARRAY, items: { type: Type.STRING } },
+          factualOrLogicErrors: { type: Type.ARRAY, items: { type: Type.STRING } },
+          improvementDirection: { type: Type.STRING },
+        },
+        required: [
+          'earnedPoints',
+          'maxPoints',
+          'criteriaScores',
+          'strengths',
+          'weaknesses',
+          'missingConcepts',
+          'factualOrLogicErrors',
+          'improvementDirection',
+        ],
+      };
+
+      const response = await withRetry(async () => {
+        try {
+          return await ai.models.generateContent({
+            model: FAST_MODEL,
+            contents: gradeContents,
+            config: {
+              systemInstruction: gradeSystem,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              responseMimeType: 'application/json',
+              responseSchema: gradeSchema,
+            },
+          });
+        } catch (err: unknown) {
+          const code = (err as { status?: number })?.status;
+          const msg = err instanceof Error ? err.message : String(err);
+          if (code === 404 || msg.includes('NOT_FOUND')) {
+            return await ai.models.generateContent({
+              model: MODEL_NAME,
+              contents: gradeContents,
+              config: {
+                systemInstruction: gradeSystem,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                responseMimeType: 'application/json',
+                responseSchema: gradeSchema,
+              },
+            });
+          }
+          throw err;
+        }
+      });
 
       const parsed = safeJsonParse<{
         earnedPoints: number;
@@ -943,13 +1250,24 @@ ${userAnswer}`,
         improvementDirection: string;
       }>(response.text, '서술형 채점');
 
-      const totalMax = Number(maxPoints) || parsed.maxPoints || 10;
-      const sumEarned = parsed.criteriaScores.reduce((acc, c) => acc + Number(c.earnedPoints || 0), 0);
+      const normalizedCriteria = (parsed.criteriaScores || []).map((c) => {
+        const maxP = Math.max(0, Number(c.maxPoints) || 0);
+        const earnedP = Math.min(maxP, Math.max(0, Number(c.earnedPoints) || 0));
+        return {
+          ...c,
+          maxPoints: maxP,
+          earnedPoints: Math.round(earnedP * 10) / 10,
+        };
+      });
+      const criteriaMaxSum = normalizedCriteria.reduce((acc, c) => acc + c.maxPoints, 0);
+      const totalMax = Number(maxPoints) || criteriaMaxSum || parsed.maxPoints || 10;
+      const sumEarned = normalizedCriteria.reduce((acc, c) => acc + c.earnedPoints, 0);
 
       res.json({
         ...parsed,
+        criteriaScores: normalizedCriteria,
         maxPoints: totalMax,
-        earnedPoints: Math.min(totalMax, Math.max(0, sumEarned)),
+        earnedPoints: Math.round(Math.min(totalMax, Math.max(0, sumEarned)) * 10) / 10,
         modelAnswer: modelAnswer || '',
         sourcePages: sourcePages || [],
         disclaimer:
@@ -991,69 +1309,328 @@ ${userAnswer}`,
       }
 
       const ai = getAiClient();
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: MODEL_NAME,
-          contents: `[개념별 누적 통계]
-${JSON.stringify(conceptStats, null, 2)}
+      const weaknessContents = `[개념별 누적 통계]
+${JSON.stringify(conceptStats)}
 
 [최근 풀이 기록]
-${JSON.stringify(recentAttempts.slice(-30), null, 2)}`,
-          config: {
-            systemInstruction: `당신은 학생의 내신 취약점 분석 코치입니다.
+${JSON.stringify(recentAttempts.slice(-30))}`;
+      const weaknessSystem = `당신은 학생의 내신 취약점 분석 코치입니다.
 분석 원칙:
 1. 단 한 문제를 실수로 틀렸다고 해서 해당 개념을 완전히 모른다고 단정하지 마세요. 반복 오답, 낮은 서술형 득점률, 최근 연속 오답 패턴을 종합해 '주의', '취약', '집중 보완'으로 구분하세요.
 2. 취약 개념마다 기존에 틀린 유형과 다른 새로운 재시험 유형(recommendedNextFormat: '5지선다형' | 'OX' | '단답형' | '서술형' | '자료해석형' | '복합개념추론형')을 추천하세요.
-3. 난이도 조정 사유(difficultyGuidance)와 우선 학습 순서를 구체적인 한국어로 설명하세요.`,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
+3. 난이도 조정 사유(difficultyGuidance)와 우선 학습 순서를 구체적인 한국어로 설명하세요.`;
+      const weaknessSchema = {
+        type: Type.OBJECT,
+        properties: {
+          overallSummary: { type: Type.STRING },
+          weakConcepts: {
+            type: Type.ARRAY,
+            items: {
               type: Type.OBJECT,
               properties: {
-                overallSummary: { type: Type.STRING },
-                weakConcepts: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      conceptName: { type: Type.STRING },
-                      severity: { type: Type.STRING },
-                      reason: { type: Type.STRING },
-                      recommendedNextFormat: { type: Type.STRING },
-                      recommendedAction: { type: Type.STRING },
-                    },
-                    required: [
-                      'conceptName',
-                      'severity',
-                      'reason',
-                      'recommendedNextFormat',
-                      'recommendedAction',
-                    ],
-                  },
-                },
-                difficultyGuidance: { type: Type.STRING },
-                studyOrderAdvice: { type: Type.ARRAY, items: { type: Type.STRING } },
+                conceptName: { type: Type.STRING },
+                severity: { type: Type.STRING },
+                reason: { type: Type.STRING },
+                recommendedNextFormat: { type: Type.STRING },
+                recommendedAction: { type: Type.STRING },
               },
-              required: ['overallSummary', 'weakConcepts', 'difficultyGuidance', 'studyOrderAdvice'],
+              required: [
+                'conceptName',
+                'severity',
+                'reason',
+                'recommendedNextFormat',
+                'recommendedAction',
+              ],
             },
           },
-        })
-      );
+          difficultyGuidance: { type: Type.STRING },
+          studyOrderAdvice: { type: Type.ARRAY, items: { type: Type.STRING } },
+        },
+        required: ['overallSummary', 'weakConcepts', 'difficultyGuidance', 'studyOrderAdvice'],
+      };
 
-      const parsed = safeJsonParse<Record<string, unknown>>(response.text, '취약점 분석');
-      res.json({ ...parsed, analyzedAt: Date.now() });
+      const response = await withRetry(async () => {
+        try {
+          return await ai.models.generateContent({
+            model: FAST_MODEL,
+            contents: weaknessContents,
+            config: {
+              systemInstruction: weaknessSystem,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              responseMimeType: 'application/json',
+              responseSchema: weaknessSchema,
+            },
+          });
+        } catch (err: unknown) {
+          const code = (err as { status?: number })?.status;
+          const msg = err instanceof Error ? err.message : String(err);
+          if (code === 404 || msg.includes('NOT_FOUND')) {
+            return await ai.models.generateContent({
+              model: MODEL_NAME,
+              contents: weaknessContents,
+              config: {
+                systemInstruction: weaknessSystem,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                responseMimeType: 'application/json',
+                responseSchema: weaknessSchema,
+              },
+            });
+          }
+          throw err;
+        }
+      });
+
+      const parsed = safeJsonParse<{
+        overallSummary?: string;
+        weakConcepts?: Array<{
+          conceptName?: string;
+          severity?: string;
+          reason?: string;
+          recommendedNextFormat?: string;
+          recommendedAction?: string;
+        }>;
+        difficultyGuidance?: string;
+        studyOrderAdvice?: string[];
+      }>(response.text, '취약점 분석');
+
+      const allowedSeverities = new Set(['주의', '취약', '집중 보완']);
+      const normalizedWeak = (parsed.weakConcepts || []).map((w) => ({
+        conceptName: (w.conceptName || '핵심 개념').trim(),
+        severity: allowedSeverities.has((w.severity || '').trim())
+          ? ((w.severity || '').trim() as '주의' | '취약' | '집중 보완')
+          : '취약',
+        reason: w.reason || '반복 오답 또는 득점 보완이 필요합니다.',
+        recommendedNextFormat: normalizeQuestionType(w.recommendedNextFormat, false),
+        recommendedAction: w.recommendedAction || '핵심 개념 복습 후 변형 문항 풀이를 권장합니다.',
+      }));
+
+      res.json({
+        overallSummary: parsed.overallSummary || '',
+        weakConcepts: normalizedWeak,
+        difficultyGuidance: parsed.difficultyGuidance || '',
+        studyOrderAdvice: Array.isArray(parsed.studyOrderAdvice) ? parsed.studyOrderAdvice : [],
+        analyzedAt: Date.now(),
+      });
     } catch (err: unknown) {
       const formatted = formatAiError(err);
       res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
+  // 7. Explain why a student's answer is wrong using broader knowledge + Google Search grounding
+  app.post('/api/ai/explain-wrong-answer', async (req: Request, res: Response) => {
+    try {
+      const {
+        subject,
+        questionText,
+        passageOrData,
+        choices,
+        correctAnswer,
+        userAnswer,
+        revealCorrectAnswer,
+      } = req.body as {
+        subject?: string;
+        questionText: string;
+        passageOrData?: string;
+        choices?: string[];
+        correctAnswer?: string;
+        userAnswer: string;
+        revealCorrectAnswer?: boolean;
+      };
+
+      if (!questionText || typeof questionText !== 'string' || !questionText.trim()) {
+        res.status(400).json({ error: '문제 내용이 누락되었습니다.' });
+        return;
+      }
+      if (!userAnswer || typeof userAnswer !== 'string' || !userAnswer.trim()) {
+        res.status(400).json({ error: '학생이 제출한 답안이 비어 있습니다.' });
+        return;
+      }
+
+      const safeUserAnswer = maskSensitivePii(userAnswer.trim());
+      const safeSubject = maskSensitivePii((subject || '교과 학습').trim());
+      const allowReveal = Boolean(revealCorrectAnswer);
+
+      const ai = getAiClient();
+
+      const explainSystem = `당신은 한국 중·고등학생의 오답 원인을 깊이 있게 찾아 설명해 주는 AI 학습 튜터입니다.
+핵심 원칙:
+1. 업로드된 교과서 범위 안에만 얽매이지 말고, Google 검색과 일반 교과·학문적 지식을 적극 활용해 학생 답안이 왜 오답(또는 불완전한 서술)인지 사실과 원리를 찾아 명확히 설명하세요.
+2. 학생이 흔히 빠지는 오개념, 인과 혼동, 용어 혼동, 조건 누락 등을 구체적으로 짚어 주세요.
+${
+  allowReveal
+    ? '3. 이번 시도는 2차 이상이거나 시험 채점 완료 상태이므로, 정답 또는 핵심 개념과 학생 답안의 차이를 분명하게 대비해 설명하세요.'
+    : '3. [절대 규칙] 학생이 아직 1차 시도에서 틀린 상태이므로, 정답(정답 번호, 정답 선택지 문구, 정답 단답 단어, 모범 답안 전체)을 절대 직접 말하거나 암시하지 마세요. 오직 학생이 고른/작성한 답안이 왜 틀렸는지(사실·원리·개념적 오류)와 다시 생각해 볼 방향만 설명하세요.'
+}
+4. 출력은 반드시 아래 두 구분자 형식으로만 한국어로 간결하게 작성하세요:
+[오답 이유]
+(학생이 제출한 답안이 왜 틀렸는지 2~4문장으로 명확히 설명)
+
+[다시 생각할 힌트]
+(정답을 직접 밝히지 않고, ${allowReveal ? '핵심 개념을 정리해 주는 복습 포인트' : '2차 시도에서 스스로 정답을 찾을 수 있도록 돕는 사고 방향'} 1~2문장)`;
+
+      const choicesBlock =
+        Array.isArray(choices) && choices.length > 0
+          ? `\n[선택지]\n${choices.map((c, idx) => `${idx + 1}. ${c}`).join('\n')}`
+          : '';
+
+      const explainContents = `[과목]
+${safeSubject}
+
+[문제]
+${questionText.trim()}
+${passageOrData ? `\n[제시 자료]\n${passageOrData.trim()}` : ''}${choicesBlock}
+
+[학생이 제출한 오답]
+${safeUserAnswer}
+
+${
+  allowReveal && correctAnswer
+    ? `[참고용 정답]\n${correctAnswer}`
+    : '[주의] 1차 시도 오답이므로 정답은 절대 직접 언급하지 말고, 학생 답안이 왜 틀렸는지 검색과 교과 지식을 바탕으로 설명하세요.'
+}`;
+
+      const runWithoutSearchTool = () =>
+        withRetry(async () => {
+          try {
+            return await ai.models.generateContent({
+              model: FAST_MODEL,
+              contents: explainContents,
+              config: {
+                systemInstruction: explainSystem,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              },
+            });
+          } catch (err: unknown) {
+            const code = (err as { status?: number })?.status;
+            const msg = err instanceof Error ? err.message : String(err);
+            if (code === 404 || msg.includes('NOT_FOUND')) {
+              return await ai.models.generateContent({
+                model: MODEL_NAME,
+                contents: explainContents,
+                config: {
+                  systemInstruction: explainSystem,
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                },
+              });
+            }
+            throw err;
+          }
+        });
+
+      let response;
+      try {
+        response = await ai.models.generateContent({
+          model: MODEL_NAME,
+          contents: explainContents,
+          config: {
+            systemInstruction: explainSystem,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            tools: [{ googleSearch: {} }],
+          },
+        });
+      } catch (searchErr: unknown) {
+        const sCode = (searchErr as { status?: number })?.status;
+        const sMsg = searchErr instanceof Error ? searchErr.message : String(searchErr);
+        // Only abort immediately on hard auth/key errors; otherwise fall back to general-knowledge AI
+        if (sCode === 403 || sMsg.includes('PERMISSION_DENIED') || sMsg.includes('API_KEY_INVALID')) {
+          throw searchErr;
+        }
+        response = await runWithoutSearchTool();
+      }
+
+      const rawText = (response.text || '').trim();
+      let whyWrong = rawText;
+      let retryHint = '';
+
+      const reasonMatch = rawText.match(/\[오답 이유\]\s*([\s\S]*?)(?=\[다시 생각할 힌트\]|$)/);
+      const hintMatch = rawText.match(/\[다시 생각할 힌트\]\s*([\s\S]*)$/);
+      if (reasonMatch && reasonMatch[1]?.trim()) {
+        whyWrong = reasonMatch[1].trim();
+      }
+      if (hintMatch && hintMatch[1]?.trim()) {
+        retryHint = hintMatch[1].trim();
+      }
+      if (!whyWrong) {
+        whyWrong = '제출한 답안의 핵심 개념 또는 조건 해석에 오류가 있습니다. 관련 원리를 다시 확인해 보세요.';
+      }
+      if (!retryHint) {
+        retryHint = allowReveal
+          ? '정답 해설과 비교하며 핵심 개념의 인과관계를 다시 정리해 보세요.'
+          : '질문에서 묻는 핵심 조건과 용어의 정확한 정의를 떠올린 뒤 2차 답안을 시도해 보세요.';
+      }
+
+      type GroundingChunkLike = { web?: { uri?: string; title?: string } };
+      const chunks =
+        (
+          response.candidates?.[0]?.groundingMetadata as
+            | { groundingChunks?: GroundingChunkLike[] }
+            | undefined
+        )?.groundingChunks || [];
+
+      const seenUris = new Set<string>();
+      const sources: Array<{ title: string; uri: string }> = [];
+      for (const chunk of chunks) {
+        const uri = chunk.web?.uri?.trim();
+        if (!uri || (!uri.startsWith('https://') && !uri.startsWith('http://'))) continue;
+        if (seenUris.has(uri)) continue;
+        seenUris.add(uri);
+        sources.push({
+          title: chunk.web?.title?.trim() || '참고 자료',
+          uri,
+        });
+        if (sources.length >= 4) break;
+      }
+
+      res.json({
+        whyWrong,
+        retryHint,
+        sources,
+        generatedAt: Date.now(),
+      });
+    } catch (err: unknown) {
+      const formatted = formatAiError(err);
+      res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
+  // JSON syntax error middleware for /api/* routes so bad requests return clean JSON
+  app.use((err: unknown, _req: Request, res: Response, next: express.NextFunction) => {
+    if (err instanceof SyntaxError && 'body' in err) {
+      res.status(400).json({ error: '잘못된 JSON 요청 형식입니다.' });
+      return;
+    }
+    next(err);
+  });
+
   // Vite dev middleware or static dist
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: 'spa',
+    });
+    // Prevent Vite 8 @vite/client from opening a failing ws://...:24678 WebSocket when HMR is disabled
+    app.get('/@vite/client', async (_req: Request, res: Response, next: express.NextFunction) => {
+      try {
+        const result = await vite.transformRequest('/@vite/client');
+        if (!result?.code) {
+          next();
+          return;
+        }
+        const patched = result.code.replace(
+          /transport\.connect\(createHMRHandler\(handleMessage\)\);?/g,
+          '/* HMR WebSocket disabled in middlewareMode */'
+        );
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(patched);
+      } catch (err) {
+        next(err);
+      }
     });
     app.use(vite.middlewares);
   } else {
@@ -1065,9 +1642,12 @@ ${JSON.stringify(recentAttempts.slice(-30), null, 2)}`,
   }
 
   const PORT = Number(process.env.PORT) || 3000;
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`BlindStudy server running on http://0.0.0.0:${PORT}`);
   });
+  httpServer.keepAliveTimeout = 65000;
+  httpServer.headersTimeout = 66000;
+  httpServer.requestTimeout = 120000;
 }
 
 createAppServer().catch((err) => {

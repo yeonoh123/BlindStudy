@@ -9,9 +9,11 @@ import type {
   QuestionType,
   Textbook,
 } from '../types/study';
-import { generateVerifiedQuestions, gradeEssayWithAI } from '../lib/api';
-import { recordAttemptAndProgress, saveQuestions } from '../lib/db';
+import { explainWrongAnswerWithAI, generateVerifiedQuestions, gradeEssayWithAI } from '../lib/api';
+import { recordAttemptAndProgress, saveAttempt, saveQuestions } from '../lib/db';
+import { isEssayQuestion, isObjectiveOrShortAnswerCorrect } from '../lib/grading';
 import { PdfPageViewerModal } from './PdfPageViewerModal';
+import { WrongAnswerAiCard } from './WrongAnswerAiCard';
 
 const ALL_QUESTION_TYPES: QuestionType[] = [
   '5지선다형',
@@ -44,7 +46,8 @@ export function ModeBQuestionsView({
   const scope = scopes.find((s) => s.id === selectedScopeId) || scopes[0];
   const textbook = scope ? textbooks.find((t) => t.id === scope.textbookId) : undefined;
 
-  const [totalCount, setTotalCount] = useState(6);
+  const [totalCountInput, setTotalCountInput] = useState('6');
+  const totalCount = Math.min(30, Math.max(5, Number(totalCountInput) || 6));
   const [difficulty, setDifficulty] = useState<QuestionDifficulty>('심화');
   const [selectedTypes, setSelectedTypes] = useState<QuestionType[]>([
     '5지선다형',
@@ -54,11 +57,14 @@ export function ModeBQuestionsView({
   const [includeExplanations, setIncludeExplanations] = useState(true);
 
   const [generating, setGenerating] = useState(false);
+  const [genProgress, setGenProgress] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [noticeMsg, setNoticeMsg] = useState<string | null>(null);
 
   const [draftAnswers, setDraftAnswers] = useState<Record<string, string>>({});
   const [gradingId, setGradingId] = useState<string | null>(null);
+  const [explainingId, setExplainingId] = useState<string | null>(null);
+  const [explainErrors, setExplainErrors] = useState<Record<string, string>>({});
   const [viewerPage, setViewerPage] = useState<number | null>(null);
 
   const scopeQuestions = useMemo(
@@ -66,12 +72,12 @@ export function ModeBQuestionsView({
     [questions, scope]
   );
 
-  const latestAttemptByQ = useMemo(() => {
-    const map = new Map<string, Attempt>();
+  const attemptsByQ = useMemo(() => {
+    const map = new Map<string, Attempt[]>();
     for (const a of attempts) {
-      if (!map.has(a.questionId)) {
-        map.set(a.questionId, a);
-      }
+      const list = map.get(a.questionId) || [];
+      list.push(a);
+      map.set(a.questionId, list);
     }
     return map;
   }, [attempts]);
@@ -109,18 +115,27 @@ export function ModeBQuestionsView({
         percentage: Math.round(100 / units.length),
       }));
 
-      const res = await generateVerifiedQuestions({
-        scopeId: scope.id,
-        subject: scope.subject,
-        scopeName: scope.name,
-        difficulty,
-        requestedCounts,
-        unitWeights,
-        concepts: scope.extractedConcepts,
-        pages,
-        existingStems: scopeQuestions.map((q) => q.questionText),
-        includeExplanations,
-      });
+      const res = await generateVerifiedQuestions(
+        {
+          scopeId: scope.id,
+          subject: scope.subject,
+          scopeName: scope.name,
+          difficulty,
+          requestedCounts,
+          unitWeights,
+          concepts: scope.extractedConcepts,
+          pages,
+          existingStems: scopeQuestions.map((q) => q.questionText),
+          includeExplanations,
+        },
+        (completed, total) => {
+          setGenProgress(
+            total > 1
+              ? `구간별 병렬 문제 생성·검증 중 (${completed}/${total})...`
+              : '교과서 분석 및 문항 검증 중...'
+          );
+        }
+      );
 
       await saveQuestions(res.questions);
       await onRefreshData();
@@ -129,6 +144,41 @@ export function ModeBQuestionsView({
       setErrorMsg(err instanceof Error ? err.message : '문제 생성 중 오류가 발생했습니다.');
     } finally {
       setGenerating(false);
+      setGenProgress(null);
+    }
+  }
+
+  async function runWrongExplanation(
+    q: Question,
+    targetAttempt: Attempt,
+    subjectName: string,
+    revealCorrectAnswer: boolean
+  ) {
+    setExplainingId(q.id);
+    setExplainErrors((prev) => {
+      const next = { ...prev };
+      delete next[q.id];
+      return next;
+    });
+    try {
+      const wrongAnalysis = await explainWrongAnswerWithAI({
+        subject: subjectName,
+        question: q,
+        userAnswer: targetAttempt.userAnswer,
+        revealCorrectAnswer,
+      });
+      await saveAttempt({
+        ...targetAttempt,
+        wrongAnalysis,
+      });
+      await onRefreshData();
+    } catch (err) {
+      setExplainErrors((prev) => ({
+        ...prev,
+        [q.id]: err instanceof Error ? err.message : '오답 원인 분석 중 오류가 발생했습니다.',
+      }));
+    } finally {
+      setExplainingId((curr) => (curr === q.id ? null : curr));
     }
   }
 
@@ -137,18 +187,20 @@ export function ModeBQuestionsView({
     const userAnswer = (draftAnswers[q.id] || '').trim();
     if (!userAnswer) return;
 
+    const priorCount = (attemptsByQ.get(q.id) || []).length;
     setGradingId(q.id);
     setErrorMsg(null);
 
     try {
-      const isEssayLike = q.type === '서술형' || (!q.choices && q.rubric && q.rubric.length > 0);
+      const isEssayLike = isEssayQuestion(q);
+      let createdAttempt: Attempt;
       if (isEssayLike) {
         const pages: PageTextEntry[] = [];
         for (const p of q.sourcePages) {
           if (textbook.pageText[p]) pages.push(textbook.pageText[p]);
         }
         const feedback = await gradeEssayWithAI({ question: q, userAnswer, pages });
-        const attempt: Attempt = {
+        createdAttempt = {
           id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           questionId: q.id,
           scopeId: scope.id,
@@ -165,12 +217,9 @@ export function ModeBQuestionsView({
           isRetest: Boolean(q.isRetest),
           submittedAt: Date.now(),
         };
-        await recordAttemptAndProgress(attempt, scope.subject);
       } else {
-        const normUser = userAnswer.replace(/\s+/g, '').toLowerCase();
-        const normCorrect = q.correctAnswer.replace(/\s+/g, '').toLowerCase();
-        const isCorrect = normUser === normCorrect;
-        const attempt: Attempt = {
+        const isCorrect = isObjectiveOrShortAnswerCorrect(q, userAnswer);
+        createdAttempt = {
           id: `att_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           questionId: q.id,
           scopeId: scope.id,
@@ -186,9 +235,15 @@ export function ModeBQuestionsView({
           isRetest: Boolean(q.isRetest),
           submittedAt: Date.now(),
         };
-        await recordAttemptAndProgress(attempt, scope.subject);
       }
+
+      await recordAttemptAndProgress(createdAttempt, scope.subject);
       await onRefreshData();
+
+      if (!createdAttempt.isCorrect) {
+        const revealNow = priorCount + 1 >= 2;
+        void runWrongExplanation(q, createdAttempt, scope.subject, revealNow);
+      }
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : '답안 채점 중 오류가 발생했습니다.');
     } finally {
@@ -250,8 +305,9 @@ export function ModeBQuestionsView({
               type="number"
               min={5}
               max={30}
-              value={totalCount}
-              onChange={(e) => setTotalCount(Number(e.target.value) || 5)}
+              value={totalCountInput}
+              onChange={(e) => setTotalCountInput(e.target.value)}
+              onBlur={() => setTotalCountInput(String(totalCount))}
               className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm tabular-nums"
             />
           </div>
@@ -298,7 +354,7 @@ export function ModeBQuestionsView({
             className="inline-flex items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-50 whitespace-nowrap"
           >
             <Sparkles className="h-4 w-4" />
-            {generating ? '교과서 분석 및 문항 검증 중...' : 'AI 예상 문제 생성'}
+            {generating ? genProgress || '교과서 분석 및 문항 검증 중...' : 'AI 예상 문제 생성'}
           </button>
         </div>
 
@@ -322,18 +378,24 @@ export function ModeBQuestionsView({
       ) : (
         <div className="space-y-5">
           {scopeQuestions.map((q, index) => {
-            const attempt = latestAttemptByQ.get(q.id);
+            const qAttempts = attemptsByQ.get(q.id) || [];
+            const attempt = qAttempts[0];
+            const attemptCount = qAttempts.length;
+            const shouldRevealAnswer = Boolean(attempt && (attempt.isCorrect || attemptCount >= 2));
+            const isEssayLike = isEssayQuestion(q);
             const currentDraft = draftAnswers[q.id] ?? attempt?.userAnswer ?? '';
 
             return (
               <div key={q.id} className="rounded-xl border border-slate-200 bg-white p-6">
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
                   <div className="text-xs text-slate-500 tabular-nums">
-                    문제 {index + 1} · {q.type} · {q.difficulty} · {q.points}점 · {q.unitName} ·{' '}
-                    {q.conceptTags.join(', ')}
+                    문제 {index + 1} · {q.type} · {q.difficulty} · {q.points}점 · {q.unitName}
+                    {(!isEssayLike || Boolean(attempt)) && q.conceptTags.length > 0
+                      ? ` · ${q.conceptTags.join(', ')}`
+                      : ''}
                     {q.isRetest ? ' · 맞춤형 재시험' : ''}
                   </div>
-                  {q.sourcePages.length > 0 && (
+                  {(!isEssayLike || Boolean(attempt)) && q.sourcePages.length > 0 && (
                     <button
                       type="button"
                       onClick={() => setViewerPage(q.sourcePages[0])}
@@ -361,8 +423,12 @@ export function ModeBQuestionsView({
                     <div className="space-y-2">
                       {q.choices.map((choice, cIdx) => {
                         const selected = currentDraft === choice;
-                        const isAnswer = attempt && choice === q.correctAnswer;
-                        const isWrongSelection = attempt && selected && !attempt.isCorrect;
+                        const isAnswer = shouldRevealAnswer && choice === q.correctAnswer;
+                        const isWrongSelection =
+                          attempt &&
+                          !attempt.isCorrect &&
+                          attempt.userAnswer === choice &&
+                          selected;
 
                         return (
                           <button
@@ -389,14 +455,14 @@ export function ModeBQuestionsView({
                         );
                       })}
                     </div>
-                  ) : q.type === '서술형' ? (
+                  ) : isEssayLike ? (
                     <textarea
                       rows={4}
                       value={currentDraft}
                       onChange={(e) =>
                         setDraftAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))
                       }
-                      placeholder="교과서 핵심 개념과 인과관계를 포함하여 서술형 답안을 작성하세요."
+                      placeholder="배운 내용을 바탕으로 서술형 답안을 작성하세요."
                       className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm leading-relaxed focus:border-blue-600 focus:outline-none"
                     />
                   ) : (
@@ -419,7 +485,13 @@ export function ModeBQuestionsView({
                     onClick={() => void handleSubmitAnswer(q)}
                     className="rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
                   >
-                    {gradingId === q.id ? '채점 중...' : attempt ? '다시 제출하기' : '정답 제출 및 채점'}
+                    {gradingId === q.id
+                      ? '채점 중...'
+                      : attempt && !shouldRevealAnswer
+                      ? '2차 도전 제출 (정답 공개)'
+                      : attempt
+                      ? '다시 제출하기'
+                      : '정답 제출 및 채점'}
                   </button>
 
                   {attempt && (
@@ -436,30 +508,52 @@ export function ModeBQuestionsView({
                       ) : (
                         <>
                           <XCircle className="h-4 w-4" />
-                          오답 ({attempt.earnedPoints}/{attempt.maxPoints}점)
+                          오답 ({attemptCount}차 시도 · {attempt.earnedPoints}/{attempt.maxPoints}점)
                         </>
                       )}
                     </div>
                   )}
                 </div>
 
-                {/* Explanation & Grounding after Attempt */}
+                {/* Feedback & Grounding after Attempt */}
                 {attempt && (
                   <div className="mt-4 space-y-2 rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm">
-                    <p className="font-semibold text-slate-900">
-                      정답: <span className="text-emerald-700">{q.correctAnswer}</span>
-                    </p>
-                    <p className="leading-relaxed text-slate-700">{q.explanation}</p>
-                    {q.sourceQuote && (
-                      <p className="text-xs leading-relaxed text-slate-500">
-                        교과서 발췌 ({q.sourcePages.join(', ')}쪽): &ldquo;{q.sourceQuote}&rdquo;
-                      </p>
+                    {shouldRevealAnswer ? (
+                      <>
+                        <p className="font-semibold text-slate-900">
+                          정답: <span className="text-emerald-700">{q.correctAnswer}</span>
+                        </p>
+                        <p className="leading-relaxed text-slate-700">{q.explanation}</p>
+                        {q.sourceQuote && (
+                          <p className="text-xs leading-relaxed text-slate-500">
+                            교과서 발췌 ({q.sourcePages.join(', ')}쪽): &ldquo;{q.sourceQuote}&rdquo;
+                          </p>
+                        )}
+                      </>
+                    ) : (
+                      <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
+                        1차 시도에서는 정답과 해설이 바로 공개되지 않습니다. 아래 AI 오답 원인을 보고
+                        답안을 수정해 <strong>2차 도전</strong>을 제출하면 정답이 공개됩니다.
+                      </div>
                     )}
+
                     {attempt.feedback && (
                       <div className="border-t border-slate-200 pt-2 text-xs text-slate-700">
-                        <p className="font-semibold text-slate-800">AI 서술형 첨삭:</p>
+                        <p className="font-semibold text-slate-800">AI 서술형 채점 피드백:</p>
                         <p className="mt-1">{attempt.feedback.improvementDirection}</p>
                       </div>
+                    )}
+
+                    {!attempt.isCorrect && (
+                      <WrongAnswerAiCard
+                        analysis={attempt.wrongAnalysis}
+                        loading={explainingId === q.id}
+                        error={explainErrors[q.id]}
+                        revealCorrectAnswer={shouldRevealAnswer}
+                        onRequestExplain={() =>
+                          void runWrongExplanation(q, attempt, scope.subject, shouldRevealAnswer)
+                        }
+                      />
                     )}
                   </div>
                 )}

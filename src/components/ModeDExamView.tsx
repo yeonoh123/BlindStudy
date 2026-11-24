@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { BookOpen, Clock, Printer, Sparkles } from 'lucide-react';
 import type {
   Attempt,
@@ -9,9 +9,11 @@ import type {
   Question,
   Textbook,
 } from '../types/study';
-import { generateVerifiedQuestions, gradeEssayWithAI } from '../lib/api';
-import { recordAttemptAndProgress, saveExamSession, saveQuestions } from '../lib/db';
+import { explainWrongAnswerWithAI, generateVerifiedQuestions, gradeEssayWithAI } from '../lib/api';
+import { recordAttemptsBatchAndProgress, saveAttempt, saveExamSession, saveQuestions } from '../lib/db';
+import { isEssayQuestion, isObjectiveOrShortAnswerCorrect } from '../lib/grading';
 import { PdfPageViewerModal } from './PdfPageViewerModal';
+import { WrongAnswerAiCard } from './WrongAnswerAiCard';
 
 interface ModeDExamViewProps {
   scopes: ExamScope[];
@@ -42,26 +44,43 @@ export function ModeDExamView({
   const [examTitle, setExamTitle] = useState(
     scope ? `${scope.name} 실전 모의평가` : '실전 내신 모의평가'
   );
-  const [mcCount, setMcCount] = useState(7);
-  const [essayCount, setEssayCount] = useState(3);
+  const [mcCountInput, setMcCountInput] = useState('7');
+  const [essayCountInput, setEssayCountInput] = useState('3');
   const [difficulty, setDifficulty] = useState<ExamDifficulty>('상위권 심화형');
-  const [timeLimitMinutes, setTimeLimitMinutes] = useState(45);
-  const [totalPoints, setTotalPoints] = useState(100);
+  const [timeLimitInput, setTimeLimitInput] = useState('45');
+  const [totalPointsInput, setTotalPointsInput] = useState('100');
+
+  const mcCount = Math.max(0, Math.min(25, Math.trunc(Number(mcCountInput) || 0)));
+  const essayCount = Math.max(0, Math.min(10, Math.trunc(Number(essayCountInput) || 0)));
+  const timeLimitMinutes = Math.max(5, Math.min(120, Math.trunc(Number(timeLimitInput) || 45)));
+  const totalPoints = Math.max(20, Math.min(100, Math.trunc(Number(totalPointsInput) || 100)));
 
   const [activeSessionId, setActiveSessionId] = useState<string | null>(
     examSessions[0]?.id || null
   );
   const activeSession = examSessions.find((s) => s.id === activeSessionId) || null;
+  const sessionScope =
+    (activeSession && scopes.find((s) => s.id === activeSession.scopeId)) || scope;
+  const sessionTextbook =
+    (sessionScope && textbooks.find((t) => t.id === sessionScope.textbookId)) || textbook;
 
   const [generating, setGenerating] = useState(false);
+  const [genProgress, setGenProgress] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const wasPositiveSecondsRef = useRef(false);
+  const submitLatestRef = useRef<(isAutoTimeout?: boolean) => Promise<void>>(async () => {});
   const [gradingProgress, setGradingProgress] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [noticeMsg, setNoticeMsg] = useState<string | null>(null);
 
-  const [answersDraft, setAnswersDraft] = useState<Record<string, string>>({});
+  const [answersDraft, setAnswersDraft] = useState<Record<string, string>>(
+    () => examSessions[0]?.answers || {}
+  );
   const [secondsLeft, setSecondsLeft] = useState<number>(0);
   const [printMode, setPrintMode] = useState<'paper' | 'answers'>('paper');
+  const [explainingQId, setExplainingQId] = useState<string | null>(null);
+  const [explainErrors, setExplainErrors] = useState<Record<string, string>>({});
   const [viewerPage, setViewerPage] = useState<number | null>(null);
 
   useEffect(() => {
@@ -70,17 +89,51 @@ export function ModeDExamView({
     }
   }, [scope?.id]);
 
-  // Timer effect while exam is in_progress
+  // Keep activeSessionId valid if sessions list changes (e.g. scope deleted or data reset)
+  useEffect(() => {
+    if (examSessions.length === 0) {
+      if (activeSessionId !== null) {
+        setActiveSessionId(null);
+        setAnswersDraft({});
+      }
+      return;
+    }
+    if (!activeSessionId || !examSessions.some((s) => s.id === activeSessionId)) {
+      setActiveSessionId(examSessions[0].id);
+      setAnswersDraft(examSessions[0].answers || {});
+    }
+  }, [examSessions, activeSessionId]);
+
+  // Persist draft answers for in_progress sessions so reload does not discard work
   useEffect(() => {
     if (!activeSession || activeSession.status !== 'in_progress') return;
-    const deadline = activeSession.startedAt + activeSession.timeLimitMinutes * 60 * 1000;
+    const timer = setTimeout(() => {
+      void saveExamSession({ ...activeSession, answers: answersDraft });
+    }, 450);
+    return () => clearTimeout(timer);
+  }, [answersDraft, activeSession?.id, activeSession?.status]);
 
-    const tick = () => {
+  // Timer effect while exam is in_progress
+  useEffect(() => {
+    if (!activeSession || activeSession.status !== 'in_progress') {
+      wasPositiveSecondsRef.current = false;
+      return;
+    }
+    const deadline = activeSession.startedAt + activeSession.timeLimitMinutes * 60 * 1000;
+    const initialRem = Math.max(0, Math.floor((deadline - Date.now()) / 1000));
+    wasPositiveSecondsRef.current = initialRem > 0;
+    setSecondsLeft(initialRem);
+
+    const timer = setInterval(() => {
       const remaining = Math.max(0, Math.floor((deadline - Date.now()) / 1000));
       setSecondsLeft(remaining);
-    };
-    tick();
-    const timer = setInterval(tick, 1000);
+      if (remaining > 0) {
+        wasPositiveSecondsRef.current = true;
+      } else if (wasPositiveSecondsRef.current && !submittingRef.current) {
+        wasPositiveSecondsRef.current = false;
+        void submitLatestRef.current(true);
+      }
+    }, 1000);
     return () => clearInterval(timer);
   }, [activeSession?.id, activeSession?.status, activeSession?.startedAt, activeSession?.timeLimitMinutes]);
 
@@ -126,21 +179,30 @@ export function ModeDExamView({
         percentage: Math.round(100 / units.length),
       }));
 
-      const res = await generateVerifiedQuestions({
-        scopeId: scope.id,
-        subject: scope.subject,
-        scopeName: scope.name,
-        difficulty,
-        requestedCounts: {
-          '5지선다형': mcCount,
-          서술형: essayCount,
+      const res = await generateVerifiedQuestions(
+        {
+          scopeId: scope.id,
+          subject: scope.subject,
+          scopeName: scope.name,
+          difficulty,
+          requestedCounts: {
+            '5지선다형': mcCount,
+            서술형: essayCount,
+          },
+          unitWeights,
+          concepts: scope.extractedConcepts,
+          pages,
+          existingStems: questions.filter((q) => q.scopeId === scope.id).map((q) => q.questionText),
+          totalPointsTarget: totalPoints,
         },
-        unitWeights,
-        concepts: scope.extractedConcepts,
-        pages,
-        existingStems: questions.filter((q) => q.scopeId === scope.id).map((q) => q.questionText),
-        totalPointsTarget: totalPoints,
-      });
+        (completed, total) => {
+          setGenProgress(
+            total > 1
+              ? `실전 시험지 병렬 출제·검증 중 (${completed}/${total})...`
+              : '실전 시험지 출제 및 검증 중...'
+          );
+        }
+      );
 
       await saveQuestions(res.questions);
 
@@ -161,42 +223,50 @@ export function ModeDExamView({
       };
 
       await saveExamSession(newSession);
-      await onRefreshData();
       setActiveSessionId(newSession.id);
       setAnswersDraft({});
+      await onRefreshData();
       if (res.notice) setNoticeMsg(res.notice);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : '실전 시험지 생성에 실패했습니다.');
     } finally {
       setGenerating(false);
+      setGenProgress(null);
     }
   }
 
-  async function handleSubmitExam() {
-    if (!activeSession || !scope || !textbook) return;
+  async function handleSubmitExam(isAutoTimeout = false) {
+    if (!activeSession || !sessionScope || !sessionTextbook) return;
+    if (submittingRef.current || activeSession.status === 'submitted') return;
+
+    submittingRef.current = true;
     setSubmitting(true);
     setErrorMsg(null);
+    if (isAutoTimeout) {
+      setNoticeMsg('제한 시간이 종료되어 작성한 답안을 자동으로 제출·채점합니다.');
+    }
 
     try {
-      const attemptIds: string[] = [];
+      const pendingAttempts: Attempt[] = [];
       let totalEarned = 0;
 
       for (let i = 0; i < sessionQuestions.length; i++) {
         const q = sessionQuestions[i];
         const userAns = (answersDraft[q.id] ?? activeSession.answers[q.id] ?? '').trim();
+        const isEssayLike = isEssayQuestion(q);
 
-        if (q.type === '서술형' || !q.choices) {
+        if (isEssayLike) {
           setGradingProgress(`서술형 문항 AI 채점 중 (${i + 1}/${sessionQuestions.length})...`);
           const pages: PageTextEntry[] = [];
           for (const p of q.sourcePages) {
-            if (textbook.pageText[p]) pages.push(textbook.pageText[p]);
+            if (sessionTextbook.pageText[p]) pages.push(sessionTextbook.pageText[p]);
           }
           const fb = await gradeEssayWithAI({ question: q, userAnswer: userAns, pages });
           const attempt: Attempt = {
             id: `att_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 6)}`,
             questionId: q.id,
-            scopeId: scope.id,
-            subject: scope.subject,
+            scopeId: sessionScope.id,
+            subject: sessionScope.subject,
             unitName: q.unitName,
             conceptTags: q.conceptTags,
             type: q.type,
@@ -207,21 +277,18 @@ export function ModeDExamView({
             maxPoints: fb.maxPoints,
             feedback: fb,
             isRetest: false,
-            submittedAt: Date.now(),
+            submittedAt: Date.now() + i,
           };
-          await recordAttemptAndProgress(attempt, scope.subject);
-          attemptIds.push(attempt.id);
+          pendingAttempts.push(attempt);
           totalEarned += fb.earnedPoints;
         } else {
-          const isCorrect =
-            userAns.replace(/\s+/g, '').toLowerCase() ===
-            q.correctAnswer.replace(/\s+/g, '').toLowerCase();
+          const isCorrect = isObjectiveOrShortAnswerCorrect(q, userAns);
           const earned = isCorrect ? q.points : 0;
           const attempt: Attempt = {
             id: `att_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 6)}`,
             questionId: q.id,
-            scopeId: scope.id,
-            subject: scope.subject,
+            scopeId: sessionScope.id,
+            subject: sessionScope.subject,
             unitName: q.unitName,
             conceptTags: q.conceptTags,
             type: q.type,
@@ -231,18 +298,19 @@ export function ModeDExamView({
             earnedPoints: earned,
             maxPoints: q.points,
             isRetest: false,
-            submittedAt: Date.now(),
+            submittedAt: Date.now() + i,
           };
-          await recordAttemptAndProgress(attempt, scope.subject);
-          attemptIds.push(attempt.id);
+          pendingAttempts.push(attempt);
           totalEarned += earned;
         }
       }
 
+      // Commit all attempts + submitted session together only after all grading calls succeed
+      await recordAttemptsBatchAndProgress(pendingAttempts, sessionScope.subject);
       const submittedSession: ExamSession = {
         ...activeSession,
-        answers: answersDraft,
-        attemptIds,
+        answers: { ...activeSession.answers, ...answersDraft },
+        attemptIds: pendingAttempts.map((a) => a.id),
         status: 'submitted',
         submittedAt: Date.now(),
         earnedPoints: Math.round(totalEarned * 10) / 10,
@@ -250,18 +318,54 @@ export function ModeDExamView({
       await saveExamSession(submittedSession);
       await onRefreshData();
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : '시험 채점 중 오류가 발생했습니다.');
+      setErrorMsg(
+        err instanceof Error
+          ? `시험 채점 중 오류가 발생해 제출이 완료되지 않았습니다 (${err.message}). 다시 제출 버튼을 눌러 주세요.`
+          : '시험 채점 중 오류가 발생했습니다.'
+      );
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
       setGradingProgress(null);
     }
   }
+  submitLatestRef.current = handleSubmitExam;
 
   function triggerPrint(mode: 'paper' | 'answers') {
     setPrintMode(mode);
     setTimeout(() => {
       window.print();
     }, 80);
+  }
+
+  async function handleExplainWrong(q: Question, att: Attempt) {
+    if (!sessionScope) return;
+    setExplainingQId(q.id);
+    setExplainErrors((prev) => {
+      const next = { ...prev };
+      delete next[q.id];
+      return next;
+    });
+    try {
+      const wrongAnalysis = await explainWrongAnswerWithAI({
+        subject: sessionScope.subject,
+        question: q,
+        userAnswer: att.userAnswer || '(미작성)',
+        revealCorrectAnswer: true,
+      });
+      await saveAttempt({
+        ...att,
+        wrongAnalysis,
+      });
+      await onRefreshData();
+    } catch (err) {
+      setExplainErrors((prev) => ({
+        ...prev,
+        [q.id]: err instanceof Error ? err.message : '오답 원인 분석 중 오류가 발생했습니다.',
+      }));
+    } finally {
+      setExplainingQId((curr) => (curr === q.id ? null : curr));
+    }
   }
 
   if (!scope || !textbook) {
@@ -330,8 +434,9 @@ export function ModeDExamView({
               type="number"
               min={0}
               max={25}
-              value={mcCount}
-              onChange={(e) => setMcCount(Number(e.target.value) || 0)}
+              value={mcCountInput}
+              onChange={(e) => setMcCountInput(e.target.value)}
+              onBlur={() => setMcCountInput(String(mcCount))}
               className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm tabular-nums"
             />
           </div>
@@ -342,8 +447,9 @@ export function ModeDExamView({
               type="number"
               min={0}
               max={10}
-              value={essayCount}
-              onChange={(e) => setEssayCount(Number(e.target.value) || 0)}
+              value={essayCountInput}
+              onChange={(e) => setEssayCountInput(e.target.value)}
+              onBlur={() => setEssayCountInput(String(essayCount))}
               className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm tabular-nums"
             />
           </div>
@@ -354,8 +460,9 @@ export function ModeDExamView({
               type="number"
               min={5}
               max={120}
-              value={timeLimitMinutes}
-              onChange={(e) => setTimeLimitMinutes(Number(e.target.value) || 30)}
+              value={timeLimitInput}
+              onChange={(e) => setTimeLimitInput(e.target.value)}
+              onBlur={() => setTimeLimitInput(String(timeLimitMinutes))}
               className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm tabular-nums"
             />
           </div>
@@ -366,8 +473,9 @@ export function ModeDExamView({
               type="number"
               min={20}
               max={100}
-              value={totalPoints}
-              onChange={(e) => setTotalPoints(Number(e.target.value) || 100)}
+              value={totalPointsInput}
+              onChange={(e) => setTotalPointsInput(e.target.value)}
+              onBlur={() => setTotalPointsInput(String(totalPoints))}
               className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm tabular-nums"
             />
           </div>
@@ -379,7 +487,11 @@ export function ModeDExamView({
               <button
                 key={sess.id}
                 type="button"
-                onClick={() => setActiveSessionId(sess.id)}
+                onClick={() => {
+                  setActiveSessionId(sess.id);
+                  setAnswersDraft(sess.answers || {});
+                  setErrorMsg(null);
+                }}
                 className={`rounded-lg border px-3 py-1.5 text-xs font-medium whitespace-nowrap ${
                   activeSessionId === sess.id
                     ? 'border-blue-600 bg-blue-50 text-blue-700'
@@ -399,7 +511,7 @@ export function ModeDExamView({
             className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-50 whitespace-nowrap"
           >
             <Sparkles className="h-4 w-4" />
-            {generating ? '실전 시험지 출제 및 검증 중...' : '새 실전 시험지 생성 및 시작'}
+            {generating ? genProgress || '실전 시험지 출제 및 검증 중...' : '새 실전 시험지 생성 및 시작'}
           </button>
         </div>
 
@@ -430,9 +542,13 @@ export function ModeDExamView({
 
             {activeSession.status === 'in_progress' ? (
               <div className="flex flex-wrap items-center gap-4">
-                <div className="flex items-center gap-1.5 font-mono-num text-sm font-semibold text-slate-800">
-                  <Clock className="h-4 w-4 text-blue-600" />
-                  남은 시간 {mm}:{ss}
+                <div
+                  className={`flex items-center gap-1.5 font-mono-num text-sm font-semibold ${
+                    secondsLeft === 0 ? 'text-red-600' : 'text-slate-800'
+                  }`}
+                >
+                  <Clock className={`h-4 w-4 ${secondsLeft === 0 ? 'text-red-600' : 'text-blue-600'}`} />
+                  {secondsLeft === 0 ? '제한 시간 종료 (00:00)' : `남은 시간 ${mm}:${ss}`}
                 </div>
                 <span className="font-mono-num text-xs text-slate-600">
                   작성 {answeredCount} / {sessionQuestions.length} (미작성{' '}
@@ -441,7 +557,7 @@ export function ModeDExamView({
                 <button
                   type="button"
                   disabled={submitting}
-                  onClick={() => void handleSubmitExam()}
+                  onClick={() => void handleSubmitExam(false)}
                   className="rounded-lg bg-slate-900 px-5 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap"
                 >
                   {submitting ? gradingProgress || '채점 중...' : '시험 제출 및 채점'}
@@ -612,6 +728,15 @@ export function ModeDExamView({
                           <p className="mt-1 text-slate-500">{att.feedback.disclaimer}</p>
                         </div>
                       )}
+                      {att && !att.isCorrect && (
+                        <WrongAnswerAiCard
+                          analysis={att.wrongAnalysis}
+                          loading={explainingQId === q.id}
+                          error={explainErrors[q.id]}
+                          revealCorrectAnswer={true}
+                          onRequestExplain={() => void handleExplainWrong(q, att)}
+                        />
+                      )}
                     </div>
                   )}
                 </div>
@@ -675,9 +800,9 @@ export function ModeDExamView({
         </div>
       )}
 
-      {viewerPage !== null && (
+      {viewerPage !== null && sessionTextbook && (
         <PdfPageViewerModal
-          textbook={textbook}
+          textbook={sessionTextbook}
           initialPage={viewerPage}
           onClose={() => setViewerPage(null)}
         />

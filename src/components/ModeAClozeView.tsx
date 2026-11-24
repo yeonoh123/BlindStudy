@@ -26,13 +26,15 @@ export function ModeAClozeView({
   const textbook = scope ? textbooks.find((t) => t.id === scope.textbookId) : undefined;
 
   const [difficulty, setDifficulty] = useState<ClozeDifficulty>('보통');
-  const [cardCount, setCardCount] = useState(10);
+  const [cardCountInput, setCardCountInput] = useState('10');
+  const cardCount = Math.min(20, Math.max(4, Number(cardCountInput) || 10));
   const [filterMode, setFilterMode] = useState<'all' | 'unknown' | 'unseen'>('all');
   const [currentIdx, setCurrentIdx] = useState(0);
   const [revealedIds, setRevealedIds] = useState<Record<string, boolean>>({});
   const [showHint, setShowHint] = useState(false);
 
   const [generating, setGenerating] = useState(false);
+  const [genProgress, setGenProgress] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [noticeMsg, setNoticeMsg] = useState<string | null>(null);
   const [viewerPage, setViewerPage] = useState<number | null>(null);
@@ -53,7 +55,8 @@ export function ModeAClozeView({
   const progressPct =
     scopeCards.length > 0 ? Math.round((knownCount / scopeCards.length) * 100) : 0;
 
-  const activeCard = filteredCards[Math.min(currentIdx, Math.max(0, filteredCards.length - 1))];
+  const safeIdx = Math.min(currentIdx, Math.max(0, filteredCards.length - 1));
+  const activeCard = filteredCards[safeIdx];
 
   async function handleGenerate() {
     if (!scope || !textbook) return;
@@ -67,14 +70,21 @@ export function ModeAClozeView({
         if (textbook.pageText[p]) pages.push(textbook.pageText[p]);
       }
 
-      const res = await generateClozeCards({
-        scopeId: scope.id,
-        subject: scope.subject,
-        difficulty,
-        concepts: scope.extractedConcepts,
-        pages,
-        count: cardCount,
-      });
+      const res = await generateClozeCards(
+        {
+          scopeId: scope.id,
+          subject: scope.subject,
+          difficulty,
+          concepts: scope.extractedConcepts,
+          pages,
+          count: cardCount,
+        },
+        (completed, total) => {
+          setGenProgress(
+            total > 1 ? `빈칸 암기장 병렬 생성 중 (${completed}/${total})...` : '빈칸 암기장 생성 중...'
+          );
+        }
+      );
 
       await saveClozeCards(res.cards);
       await onRefreshData();
@@ -86,6 +96,7 @@ export function ModeAClozeView({
       setErrorMsg(err instanceof Error ? err.message : '암기장 생성 중 오류가 발생했습니다.');
     } finally {
       setGenerating(false);
+      setGenProgress(null);
     }
   }
 
@@ -125,6 +136,7 @@ export function ModeAClozeView({
                 onChange={(e) => {
                   onSelectScopeId(e.target.value);
                   setCurrentIdx(0);
+                  setShowHint(false);
                 }}
                 className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
               >
@@ -162,8 +174,9 @@ export function ModeAClozeView({
                 type="number"
                 min={4}
                 max={20}
-                value={cardCount}
-                onChange={(e) => setCardCount(Number(e.target.value) || 10)}
+                value={cardCountInput}
+                onChange={(e) => setCardCountInput(e.target.value)}
+                onBlur={() => setCardCountInput(String(cardCount))}
                 className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm tabular-nums"
               />
             </div>
@@ -176,7 +189,7 @@ export function ModeAClozeView({
             className="inline-flex items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-50 whitespace-nowrap"
           >
             <Sparkles className="h-4 w-4" />
-            {generating ? '빈칸 암기장 생성 중...' : '새 암기 카드 생성'}
+            {generating ? genProgress || '빈칸 암기장 생성 중...' : '새 암기 카드 생성'}
           </button>
         </div>
 
@@ -274,7 +287,7 @@ export function ModeAClozeView({
         <div className="rounded-xl border border-slate-200 bg-white p-6 md:p-8">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-4">
             <div className="text-xs text-slate-500 tabular-nums">
-              카드 {currentIdx + 1} / {filteredCards.length} · {activeCard.conceptName} · 난이도{' '}
+              카드 {safeIdx + 1} / {filteredCards.length} · {activeCard.conceptName} · 난이도{' '}
               {activeCard.difficulty} · 근거 PDF {activeCard.sourcePage}쪽
             </div>
             <button
@@ -335,9 +348,9 @@ export function ModeAClozeView({
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                disabled={currentIdx <= 0}
+                disabled={safeIdx <= 0}
                 onClick={() => {
-                  setCurrentIdx((i) => Math.max(0, i - 1));
+                  setCurrentIdx(Math.max(0, safeIdx - 1));
                   setShowHint(false);
                 }}
                 className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40"
@@ -347,9 +360,9 @@ export function ModeAClozeView({
               </button>
               <button
                 type="button"
-                disabled={currentIdx >= filteredCards.length - 1}
+                disabled={safeIdx >= filteredCards.length - 1}
                 onClick={() => {
-                  setCurrentIdx((i) => Math.min(filteredCards.length - 1, i + 1));
+                  setCurrentIdx(Math.min(filteredCards.length - 1, safeIdx + 1));
                   setShowHint(false);
                 }}
                 className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40"
