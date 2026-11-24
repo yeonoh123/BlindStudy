@@ -72,7 +72,7 @@ async function postJson<T>(
         }
         if (res.status === 404 && !data.error) {
           throw new Error(
-            '백엔드 API 서버(/api)를 찾을 수 없습니다 (HTTP 404). GitHub Pages 등 정적 웹 호스팅에서는 AI 백엔드(server.ts)가 실행되지 않으므로, 로컬(npm run dev) 또는 Node.js 서버 호스팅(Render·Railway·Cloud Run 등)에서 실행해 주세요.'
+            '백엔드 API 서버(/api)를 찾을 수 없습니다 (HTTP 404). Vercel에 배포한 경우 최신 코드(api/ 및 vercel.json 포함)를 다시 푸시하고 Settings > Environment Variables에 GEMINI_API_KEY를 설정했는지 확인해 주세요.'
           );
         }
         throw new Error(data.error || `요청 처리 중 오류가 발생했습니다 (HTTP ${res.status}).`);
